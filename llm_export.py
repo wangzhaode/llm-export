@@ -1,5 +1,8 @@
 import os
 import base64
+import glob
+import shutil
+import argparse
 import torch
 import numpy as np
 import onnxruntime as ort
@@ -35,6 +38,7 @@ class LLM(torch.nn.Module):
         # export config
         self.export_path = './onnx'
         self.export_verbose = False
+        self.export_test = False
 
     def load_model(self, model_path: str):
         raise NotImplementedError
@@ -91,6 +95,7 @@ class LLM(torch.nn.Module):
             position_ids = self.get_position_ids()
             token_id, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
             if token_id == self.stop_id:
+                print("", end='\n')
                 break
             word = self.id_to_str(token_id)
             print(word, end="", flush=True)
@@ -122,13 +127,14 @@ class LLM(torch.nn.Module):
                         do_constant_folding=True,
                         opset_version=15)
         # test lm
-        original_outs = model(hidden_states)
-        ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-        inputs = {
-            'hidden_states' : hidden_states.numpy(),
-        }
-        onnx_outs = ort_session.run(None, inputs)
-        self.assert_equal(original_outs, onnx_outs)
+        if self.export_test:
+            original_outs = model(hidden_states)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'hidden_states' : hidden_states.numpy(),
+            }
+            onnx_outs = ort_session.run(None, inputs)
+            self.assert_equal(original_outs, onnx_outs)
 
     def export_embed(self):
         model = self.embed
@@ -145,13 +151,14 @@ class LLM(torch.nn.Module):
                         do_constant_folding=True,
                         opset_version=15)
         # test
-        original_outs = model(input_ids)
-        ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-        inputs = {
-            'input_ids' : input_ids.numpy(),
-        }
-        onnx_outs = ort_session.run(None, inputs)
-        self.assert_equal(original_outs, onnx_outs)
+        if self.export_test:
+            original_outs = model(input_ids)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'input_ids' : input_ids.numpy(),
+            }
+            onnx_outs = ort_session.run(None, inputs)
+            self.assert_equal(original_outs, onnx_outs)
 
     def export_block(self, block_id: int):
         self.seq_len = 3
@@ -173,16 +180,21 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.block_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        original_outs = model(inputs_embeds, attention_mask, position_ids, past_key_values)
-        ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-        inputs = {
-            'inputs_embeds' : inputs_embeds.detach().numpy(),
-            'attention_mask' : attention_mask.numpy(),
-            'position_ids' : position_ids.numpy(),
-            'past_key_values' : past_key_values.numpy()
-        }
-        onnx_outs = ort_session.run(None, inputs)
-        self.assert_equal(original_outs, onnx_outs)
+        if self.export_test:
+            original_outs = model(inputs_embeds, attention_mask, position_ids, past_key_values)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'inputs_embeds' : inputs_embeds.detach().numpy(),
+                'attention_mask' : attention_mask.numpy(),
+                'position_ids' : position_ids.numpy(),
+                'past_key_values' : past_key_values.numpy()
+            }
+            onnx_outs = ort_session.run(None, inputs)
+            self.assert_equal(original_outs, onnx_outs)
+
+    def export_blocks(self):
+        for i in range(self.block_nums):
+            self.export_block(i)
 
     def export(self):
         model = self
@@ -204,17 +216,18 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        # test
-        original_outs = model(input_ids, attention_mask, position_ids, past_key_values)
-        ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-        inputs = {
-            'input_ids' : input_ids.detach().numpy(),
-            'attention_mask' : attention_mask.numpy(),
-            'position_ids' : position_ids.numpy(),
-            'past_key_values' : past_key_values.numpy()
-        }
-        onnx_outs = ort_session.run(None, inputs)
-        self.assert_equal(original_outs, onnx_outs)
+        if self.export_test:
+            # test
+            original_outs = model(input_ids, attention_mask, position_ids, past_key_values)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'input_ids' : input_ids.detach().numpy(),
+                'attention_mask' : attention_mask.numpy(),
+                'position_ids' : position_ids.numpy(),
+                'past_key_values' : past_key_values.numpy()
+            }
+            onnx_outs = ort_session.run(None, inputs)
+            self.assert_equal(original_outs, onnx_outs)
 
 # chatglm
 class GLMBlock(torch.nn.Module):
@@ -462,13 +475,75 @@ class Qwen_7b_Chat(LLM):
                 fp.write(line)
 
 if __name__ == '__main__':
-    model = '../chatglm2-6b'
-    llm_exporter = Chatglm2_6b(model)
-    #model = '../Qwen-7B-Chat'
-    #llm_exporter = Qwen_7b_Chat(model)
-    # llm_exporter.response("你好")
-    llm_exporter.export_vocab()
-    #llm_exporter.export_lm()
-    #llm_exporter.export_embed()
-    #llm_exporter.export_block(0)
-    #llm_exporter.export()
+    llm_models = {
+        'chatglm-6b': Chatglm_6b,
+        'chatglm2-6b': Chatglm2_6b,
+        'Qwen-7B-Chat': Qwen_7b_Chat
+    }
+    parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
+                        help='path(`str` or `os.PathLike`):\nCan be either:'
+                        '\n\t- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]'
+                        '\n\t- A path to a *directory* clone from repo like `../chatglm-6b`.')
+    parser.add_argument('--type', type=str, choices=llm_models.keys(), default=None,
+                        help='type(`str`, *optional*):'
+                        '\n\tThe pretrain llm model type.'
+                        )
+    parser.add_argument('--export_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
+    parser.add_argument('--export_verbose', action='store_true', default=False, help='Whether or not to export onnx with verbose.')
+    parser.add_argument('--export_test', action='store_true', help='Whether or not to export onnx with test using onnxruntime.')
+    parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
+    parser.add_argument('--export', action='store_true', help='export model to an `onnx` model.')
+    parser.add_argument('--export_split', action='store_true',
+                        help='export model split to some `onnx` models:'
+                        '\n\t- embedding model.'
+                        '\n\t- block models.'
+                        '\n\t- lm_head model.'
+                        )
+    parser.add_argument('--export_vocab', action='store_true', help='export llm vocab to a txt file.')
+    parser.add_argument('--export_embed', action='store_true', help='export llm embedding to an `onnx` model.')
+    parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
+    parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
+    parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
+
+    args = parser.parse_args()
+    model_path = args.path
+    model_type = args.type
+    # not sepcify model type, using path
+    if model_type is None:
+        for model in llm_models:
+            if model in model_path:
+                model_type = model
+    if model_type is None:
+        raise RuntimeError('Please specify model type.')
+
+    # copy modeling py file to pretrain model for export
+    for file in glob.glob(f'./llm_models/{model_type}/*'):
+        shutil.copy2(file, model_path)
+
+    llm_exporter = llm_models[model_type](model_path)
+    llm_exporter.export_path = args.export_path
+    llm_exporter.export_verbose = args.export_verbose
+    llm_exporter.export_test = args.export_test
+
+    # some actions
+    if args.test is not None:
+        llm_exporter.response(args.test)
+
+    if args.export:
+        llm_exporter.export()
+
+    if args.export_vocab:
+        llm_exporter.export_vocab()
+
+    if args.export_embed or args.export_split:
+        llm_exporter.export_embed()
+
+    if args.export_lm or args.export_split:
+        llm_exporter.export_lm()
+
+    if args.export_blocks or args.export_split:
+        llm_exporter.export_blocks()
+
+    if args.export_block is not None:
+        llm_exporter.export_block(args.export_block)
