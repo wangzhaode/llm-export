@@ -14,7 +14,7 @@ git clone https://huggingface.co/THUDM/chatglm2-6b
 3. 执行LLMExporter导出模型
 ```sh
 cd LLMExporter
-python llm_export.py --path ../chatglm-6b --export_path ./onnx --export
+python llm_export.py --path ../chatglm2-6b --export_path ./onnx --export
 ```
 ## 功能
 - 支持将模型完整导出为一个onnx模型，使用`--export`
@@ -25,6 +25,11 @@ python llm_export.py --path ../chatglm-6b --export_path ./onnx --export
 - 支持导出模型的lm_head层为一个onnx模型，使用`--export_lm`
 - 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
 - 支持在导出onnx模型后使用onnxruntime对结果一致性进行校验，使用`--export_test`
+
+## 模型支持
+- chatglm-6b
+- chatglm2-6b
+- Qwen-7B-Chat
 
 ## 参数
 ```
