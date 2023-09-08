@@ -10,12 +10,20 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # some wrapper class for export
 class Embedding(torch.nn.Module):
-    def __init__(self, embed):
+    def __init__(self, embed, using_bf16: bool = False):
         super().__init__()
-        self.embed = embed
+        self.bf16 = using_bf16
+        if using_bf16:
+            # using bf16 embedding weight
+            self.embed = embed.bfloat16()
+        else:
+            self.embed = embed
 
     def forward(self, input_ids):
-        return self.embed(input_ids)
+        res = self.embed(input_ids)
+        if self.bf16:
+            res = res.float()
+        return res.view(-1, 1, 4096)
 
 class Lm(torch.nn.Module):
     def __init__(self, lm):
@@ -32,13 +40,13 @@ class LLM(torch.nn.Module):
     Base class for all llm model. Inherits from [`torch.nn.Module`].
     '''
 
-    def __init__(self, model_path: str, export_path: str = None):
+    def __init__(self, args):
         super().__init__()
-        self.load_model(model_path)
-        # export config
-        self.export_path = './onnx'
-        self.export_verbose = False
-        self.export_test = False
+        self.export_path = args.export_path
+        self.export_verbose = args.export_verbose
+        self.export_test = args.export_test
+        self.embed_bf16 = args.embed_bf16
+        self.load_model(args.path)
 
     def load_model(self, model_path: str):
         raise NotImplementedError
@@ -53,12 +61,11 @@ class LLM(torch.nn.Module):
         raise NotImplementedError
 
     def forward(self, input_ids, attention_mask, position_ids, past_key_values):
-        hidden_states = self.embed(input_ids).view(-1, 1, 4096)
+        hidden_states = self.embed(input_ids)
         presents = []
         for i in range(self.block_nums):
             hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])
             presents.append(kv)
-        hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
         token_id = self.lm(hidden_states).view(1)
         presents = torch.stack(presents)
         self.seq_len += 1
@@ -246,13 +253,14 @@ class GLMBlock(torch.nn.Module):
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
 
 class Chatglm_6b(LLM):
-    def __init__(self, model_path: str):
-        super().__init__(model_path)
+    def __init__(self, args):
+        super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -265,8 +273,14 @@ class Chatglm_6b(LLM):
         # some wrapper
         self.stop_id = self.tokenizer._convert_token_to_id(self.tokenizer.eos_token)
         self.block_nums = len(self.blocks_)
-        self.embed = Embedding(self.embed_)
         self.lm = Lm(self.lm_)
+        # chatglm embedding and lm using same param, copy embedding when using bf16
+        if self.embed_bf16:
+            import copy
+            embed_copy = copy.deepcopy(self.embed_)
+            self.embed = Embedding(embed_copy, self.embed_bf16)
+        else:
+            self.embed = Embedding(self.embed_, self.embed_bf16)
         self.blocks = [GLMBlock(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.past_kv_shape = [28, 2, 0, 1, 32, 128]
@@ -335,13 +349,14 @@ class GLM2Block(torch.nn.Module):
                                             rotary_pos_emb=rotary_pos_emb)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
 
 class Chatglm2_6b(LLM):
-    def __init__(self, model_path: str):
-        super().__init__(model_path)
+    def __init__(self, args):
+        super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -354,7 +369,7 @@ class Chatglm2_6b(LLM):
         # some wrapper
         self.stop_id = self.tokenizer.eos_token_id
         self.block_nums = len(self.blocks_)
-        self.embed = Embedding(self.embed_)
+        self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
         self.blocks = [GLM2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
@@ -417,13 +432,14 @@ class QWENBlock(torch.nn.Module):
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
 
 class Qwen_7b_Chat(LLM):
-    def __init__(self, model_path: str):
-        super().__init__(model_path)
+    def __init__(self, args):
+        super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -436,7 +452,7 @@ class Qwen_7b_Chat(LLM):
         # some wrapper
         self.stop_id = self.tokenizer.im_end_id
         self.block_nums = len(self.blocks_)
-        self.embed = Embedding(self.embed_)
+        self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
         self.blocks = [QWENBlock(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
@@ -505,6 +521,8 @@ if __name__ == '__main__':
     parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
     parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
     parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
+    parser.add_argument('--embed_bf16', action='store_true', help='using `bfloat16` replace `float32` in embedding.')
+
 
     args = parser.parse_args()
     model_path = args.path
@@ -521,10 +539,7 @@ if __name__ == '__main__':
     for file in glob.glob(f'./llm_models/{model_type}/*'):
         shutil.copy2(file, model_path)
 
-    llm_exporter = llm_models[model_type](model_path)
-    llm_exporter.export_path = args.export_path
-    llm_exporter.export_verbose = args.export_verbose
-    llm_exporter.export_test = args.export_test
+    llm_exporter = llm_models[model_type](args)
 
     # some actions
     if args.test is not None:

@@ -20,7 +20,7 @@ python llm_export.py --path ../chatglm2-6b --export_path ./onnx --export
 - 支持将模型完整导出为一个onnx模型，使用`--export`
 - 支持将模型分段导出为多个模型，使用`--export_split`
 - 支持导出模型的词表到一个文本文件，每行代表一个token；其中token使用base64编码；使用`--export_verbose`
-- 支持导出模型的Embedding层为一个onnx模型，使用`--export_embed`
+- 支持导出模型的Embedding层为一个onnx模型，使用`--export_embed`，同时支持bf16格式，使用`--embed_bf16`
 - 支持分层导出模型的block，使用`--export_blocks`导出全部层；使用`--export_block $id`导出指定层
 - 支持导出模型的lm_head层为一个onnx模型，使用`--export_lm`
 - 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
@@ -64,4 +64,5 @@ optional arguments:
   --export_block EXPORT_BLOCK
                         export llm block [id] to an `onnx` model.
   --export_blocks       export llm all blocks to `onnx` models.
+  --embed_bf16          using `bfloat16` replace `float32` in embedding.
 ```
