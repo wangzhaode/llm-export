@@ -47,6 +47,7 @@ class LLM(torch.nn.Module):
         self.export_test = args.export_test
         self.embed_bf16 = args.embed_bf16
         self.load_model(args.path)
+        self.max_length = 1024
 
     def load_model(self, model_path: str):
         raise NotImplementedError
@@ -97,7 +98,7 @@ class LLM(torch.nn.Module):
         self.token_len = 0
         past_key_values = [None for i in range(self.block_nums)]
         token_id = input_ids
-        while self.token_len < 64:
+        while self.token_len < self.max_length:
             attention_mask = self.get_attention_mask()
             position_ids = self.get_position_ids()
             token_id, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
@@ -342,7 +343,7 @@ class GLM2Block(torch.nn.Module):
         theta = 1.0 / (10000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
-        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1).transpose(0, 1).contiguous()
+        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1).unsqueeze(0).contiguous()
         hidden_states, presents = self.block(hidden_states,
                                             attention_mask,
                                             kv_cache=past_kv,
@@ -357,6 +358,9 @@ class GLM2Block(torch.nn.Module):
 class Chatglm2_6b(LLM):
     def __init__(self, args):
         super().__init__(args)
+        self.model_name = 'Chatglm2_6b'
+        if 'codegeex2-6b' in args.path:
+            self.model_name = 'Codegeex2_6b'
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -368,6 +372,9 @@ class Chatglm2_6b(LLM):
         self.final_layernorm_ = transformer.encoder.final_layernorm
         # some wrapper
         self.stop_id = self.tokenizer.eos_token_id
+        if self.stop_id is None:
+            # codegeex2-6b
+            self.stop_id = self.tokenizer.tokenizer.eos_id
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
@@ -400,12 +407,13 @@ class Chatglm2_6b(LLM):
 
     def export_vocab(self):
         vocab = self.tokenizer.get_vocab()
-        vocab_list = ['<' + str(i) + '>\n' for i in range(len(vocab))]
+        # 65024 is padding size > len(vocab)
+        vocab_list = ['<' + str(i) + '>\n' for i in range(65024)]
         for k, v in vocab.items():
             if '▁' in k: k = k.replace('▁', ' ')
             k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
             vocab_list[v] = k
-        file_path = os.path.join(self.export_path, "Chatglm2_6b_vocab.txt")
+        file_path = os.path.join(self.export_path, f"{self.model_name}_vocab.txt")
         with open(file_path, "w", encoding="utf8") as fp:
             for v in vocab_list:
                 fp.write(v)
@@ -576,6 +584,7 @@ if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
         'chatglm2-6b': Chatglm2_6b,
+        'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Baichuan2_7B_Chat
     }

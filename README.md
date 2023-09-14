@@ -5,6 +5,7 @@ LLMExporter是一个LLM模型导出工具，能够将LLM模型导出到onnx模�
 ## 模型支持
 - chatglm-6b
 - chatglm2-6b
+- codegeex2-6b
 - Qwen-7B-Chat
 - Baichuan2-7B-Chat
 
