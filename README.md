@@ -2,12 +2,17 @@
 
 llm-export是一个llm模型导出工具，能够将llm模型导出到onnx模型。
 
-## 模型支持
-- chatglm-6b
-- chatglm2-6b
-- codegeex2-6b
-- Qwen-7B-Chat
-- Baichuan2-7B-Chat
+- 🚀 均完成`onnxruntime`正确性测试
+- 🚀 优化原始代码，支持动态形状
+- 🚀 优化原始代码，减少不必要常量
+
+
+## 模型支持与下载
+- ✅ [chatglm-6b](https://github.com/wangzhaode/llm-export/releases/tag/chatglm-6b-onnx)
+- ✅ [chatglm2-6b](https://github.com/wangzhaode/llm-export/releases/tag/chatglm2-6b-onnx)
+- ✅ [codegeex2-6b](https://github.com/wangzhaode/llm-export/releases/tag/codegeex2-6b-onnx)
+- ✅ [Qwen-7B-Chat](https://github.com/wangzhaode/llm-export/releases/tag/qwen-7b-chat-onnx)
+- ✅ [Baichuan2-7B-Chat](https://github.com/wangzhaode/llm-export/releases/tag/baichuan2-7b-chat-onnx)
 
 ## 用法
 1. 将该项目clone到本地
@@ -25,6 +30,7 @@ git clone https://modelscope.cn/ZhipuAI/chatglm2-6b.git
 cd LLMExporter
 python llm_export.py --path ../chatglm2-6b --export_path ./onnx --export
 ```
+
 ## 功能
 - 支持将模型完整导出为一个onnx模型，使用`--export`
 - 支持将模型分段导出为多个模型，使用`--export_split`
