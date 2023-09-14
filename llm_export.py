@@ -400,7 +400,7 @@ class Chatglm2_6b(LLM):
 
     def export_vocab(self):
         vocab = self.tokenizer.get_vocab()
-        vocab_list = ['<' + str(i) + '>\n' for i in range(65024)]
+        vocab_list = ['<' + str(i) + '>\n' for i in range(len(vocab))]
         for k, v in vocab.items():
             if '▁' in k: k = k.replace('▁', ' ')
             k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
@@ -458,7 +458,7 @@ class Qwen_7b_Chat(LLM):
         # some config for export
         self.past_kv_shape = [32, 2, 1, 0, 32, 128]
         self.block_dynamic_axes = {
-            "inputs_embeds" : { 1: "seq_len" },
+            "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 0: "seq_len" },
             "past_key_values" : { 2: "history_len" }
@@ -480,7 +480,7 @@ class Qwen_7b_Chat(LLM):
 
     def get_position_ids(self) -> torch.Tensor:
         if self.token_len:
-            return torch.tensor([self.seq_len], dtype=torch.long)
+            return torch.tensor([self.seq_len - 1], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
 
     def export_vocab(self):
@@ -490,11 +490,94 @@ class Qwen_7b_Chat(LLM):
                 line = base64.b64encode(k).decode("utf8") + "\n"
                 fp.write(line)
 
+# baichuan
+class BAICHUANBlock(torch.nn.Module):
+    def __init__(self, block, block_id, final_layernorm = None):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.final_layernorm = final_layernorm
+
+    def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        hidden_states = hidden_states.view(1, -1, 4096)
+        hidden_states, presents = self.block(hidden_states,
+                                             attention_mask,
+                                             position_ids,
+                                             past_kv,
+                                             use_cache=True)
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
+        if isinstance(presents, tuple):
+            presents = torch.stack(presents)
+        return hidden_states, presents
+
+class Baichuan2_7B_Chat(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        transformer = model.model
+        self.lm_ = model.lm_head
+        self.embed_ = transformer.embed_tokens
+        self.blocks_ = transformer.layers
+        self.final_layernorm_ = transformer.norm
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        self.block_nums = len(self.blocks_)
+        self.embed = Embedding(self.embed_, self.embed_bf16)
+        self.lm = Lm(self.lm_)
+        self.blocks = [BAICHUANBlock(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        # some config for export
+        self.past_kv_shape = [32, 2, 1, 32, 0, 128]
+        self.block_dynamic_axes = {
+            "inputs_embeds" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 3: "history_len" }
+        }
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 4: "history_len" }
+        }
+
+    def build_prompt(self, query):
+        return f'<reserved_106>{query}<reserved_107>'
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+        return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
+
+    def get_position_ids(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+
+    def export_vocab(self):
+        vocab = self.tokenizer.get_vocab()
+        vocab_list = ['<' + str(i) + '>\n' for i in range(len(vocab))]
+        for k, v in vocab.items():
+            print(k, v)
+            if '▁' in k: k = k.replace('▁', ' ')
+            k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
+            vocab_list[v] = k
+        file_path = os.path.join(self.export_path, "Baichuan2_7B_vocab.txt")
+        with open(file_path, "w", encoding="utf8") as fp:
+            for v in vocab_list:
+                fp.write(v)
+
+
 if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
         'chatglm2-6b': Chatglm2_6b,
-        'Qwen-7B-Chat': Qwen_7b_Chat
+        'Qwen-7B-Chat': Qwen_7b_Chat,
+        'Baichuan2-7B-Chat': Baichuan2_7B_Chat
     }
     parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
