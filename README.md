@@ -1,6 +1,6 @@
-# LLMExporter
+# llm-export
 
-LLMExporter是一个LLM模型导出工具，能够将LLM模型导出到onnx模型。
+llm-export是一个llm模型导出工具，能够将llm模型导出到onnx模型。
 
 ## 模型支持
 - chatglm-6b
