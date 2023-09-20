@@ -498,8 +498,8 @@ class Qwen_7b_Chat(LLM):
                 line = base64.b64encode(k).decode("utf8") + "\n"
                 fp.write(line)
 
-# baichuan
-class BAICHUANBlock(torch.nn.Module):
+# llama2
+class LLAMA2Block(torch.nn.Module):
     def __init__(self, block, block_id, final_layernorm = None):
         super().__init__()
         self.block = block
@@ -520,9 +520,12 @@ class BAICHUANBlock(torch.nn.Module):
             presents = torch.stack(presents)
         return hidden_states, presents
 
-class Baichuan2_7B_Chat(LLM):
+class Llama2_7b_Chat(LLM):
     def __init__(self, args):
         super().__init__(args)
+        self.model_name = 'Llama2_7b'
+        if 'Baichuan2' in args.path:
+            self.model_name = 'Baichuan2_7B'
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -537,7 +540,7 @@ class Baichuan2_7B_Chat(LLM):
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [BAICHUANBlock(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.past_kv_shape = [32, 2, 1, 32, 0, 128]
         self.block_dynamic_axes = {
@@ -554,7 +557,10 @@ class Baichuan2_7B_Chat(LLM):
         }
 
     def build_prompt(self, query):
-        return f'<reserved_106>{query}<reserved_107>'
+        if 'Baichuan2' in self.model_name:
+            return f'<reserved_106>{query}<reserved_107>'
+        return f'[INST]{query}[/INST]'
+
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -574,11 +580,10 @@ class Baichuan2_7B_Chat(LLM):
             if '▁' in k: k = k.replace('▁', ' ')
             k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
             vocab_list[v] = k
-        file_path = os.path.join(self.export_path, "Baichuan2_7B_vocab.txt")
+        file_path = os.path.join(self.export_path, f"{self.model_name}_vocab.txt")
         with open(file_path, "w", encoding="utf8") as fp:
             for v in vocab_list:
                 fp.write(v)
-
 
 if __name__ == '__main__':
     llm_models = {
@@ -586,7 +591,8 @@ if __name__ == '__main__':
         'chatglm2-6b': Chatglm2_6b,
         'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_7b_Chat,
-        'Baichuan2-7B-Chat': Baichuan2_7B_Chat
+        'Baichuan2-7B-Chat': Llama2_7b_Chat,
+        'Llama-2-7b-chat-ms': Llama2_7b_Chat
     }
     parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
