@@ -54,12 +54,13 @@ python llm_export.py --path ../chatglm2-6b --export_path ./onnx --export
 - 支持导出模型的lm_head层为一个onnx模型，使用`--export_lm`
 - 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
 - 支持在导出onnx模型后使用onnxruntime对结果一致性进行校验，使用`--export_test`
+- 支持将tokenizer导出为文本文件，使用`--export_token`
 
 ## 参数
 ```
-usage: llm_export.py [-h] --path PATH [--type {chatglm-6b,chatglm2-6b,Qwen-7B-Chat}] [--export_path EXPORT_PATH] [--export_verbose] [--export_test]
-                     [--test TEST] [--export] [--export_split] [--export_vocab] [--export_embed] [--export_lm] [--export_block EXPORT_BLOCK]
-                     [--export_blocks]
+usage: llm_export.py [-h] --path PATH [--type {chatglm-6b,chatglm2-6b,codegeex2-6b,Qwen-7B-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms}]
+                     [--export_path EXPORT_PATH] [--export_verbose] [--export_test] [--test TEST] [--export] [--export_split] [--export_token]
+                     [--export_embed] [--export_lm] [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bf16]
 
 LLMExporter
 
@@ -69,7 +70,7 @@ optional arguments:
                         Can be either:
                         	- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
                         	- A path to a *directory* clone from repo like `../chatglm-6b`.
-  --type {chatglm-6b,chatglm2-6b,Qwen-7B-Chat}
+  --type {chatglm-6b,chatglm2-6b,codegeex2-6b,Qwen-7B-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms}
                         type(`str`, *optional*):
                         	The pretrain llm model type.
   --export_path EXPORT_PATH
@@ -82,7 +83,7 @@ optional arguments:
                         	- embedding model.
                         	- block models.
                         	- lm_head model.
-  --export_vocab        export llm vocab to a txt file.
+  --export_token        export llm tokenizer to a txt file.
   --export_embed        export llm embedding to an `onnx` model.
   --export_lm           export llm lm_head to an `onnx` model.
   --export_block EXPORT_BLOCK

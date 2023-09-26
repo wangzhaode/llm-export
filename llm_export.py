@@ -6,6 +6,7 @@ import argparse
 import torch
 import numpy as np
 import onnxruntime as ort
+import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # some wrapper class for export
@@ -46,6 +47,11 @@ class LLM(torch.nn.Module):
         self.export_verbose = args.export_verbose
         self.export_test = args.export_test
         self.embed_bf16 = args.embed_bf16
+        tokenizer_model = os.path.join(args.path, 'tokenizer.model')
+        if os.path.exists(tokenizer_model):
+            self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
+        else:
+            self.sp_model = None
         self.load_model(args.path)
         self.max_length = 1024
 
@@ -237,6 +243,40 @@ class LLM(torch.nn.Module):
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
 
+    def export_tokenizer(self):
+        file_path = os.path.join(self.export_path, "tokenizer.txt")
+        if self.sp_model is not None:
+            # senetencepiece
+            NORMAL = 1; UNKNOWN = 2; CONTROL = 3
+            USER_DEFINED = 4; UNUSED = 5; BYTE = 6
+            fp = open(file_path, "w", encoding="utf8")
+            for i in range(self.sp_model.GetPieceSize()):
+                token = self.sp_model.IdToPiece(i)
+                score = self.sp_model.GetScore(i)
+                type = NORMAL
+                if self.sp_model.IsUnknown(i):
+                    type = UNKNOWN
+                elif self.sp_model.IsControl(i):
+                    type = CONTROL
+                elif self.sp_model.IsUnused(i):
+                    type = UNUSED
+                elif self.sp_model.IsByte(i):
+                    type = BYTE
+                if self.model_name == 'Chatglm_6b':
+                    if '<n>' in token: token = '\n'
+                    if '<|tab|>' in token: token = '\t'
+                    if '<|blank_' in token: token = ' ' * int(token[8:token.find('|>')])
+                if '▁' in token: token = token.replace('▁', ' ')
+                token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
+                fp.write(f'{token_encode} {score} {type}\n')
+            fp.close()
+        else:
+            # tikton
+            with open(file_path, "w", encoding="utf8") as fp:
+                for k, v in self.tokenizer.mergeable_ranks.items():
+                    line = base64.b64encode(k).decode("utf8") + "\n"
+                    fp.write(line)
+
 # chatglm
 class GLMBlock(torch.nn.Module):
     def __init__(self, block, block_id, final_layernorm = None):
@@ -262,6 +302,7 @@ class GLMBlock(torch.nn.Module):
 class Chatglm_6b(LLM):
     def __init__(self, args):
         super().__init__(args)
+        self.model_name = 'Chatglm_6b'
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -315,21 +356,6 @@ class Chatglm_6b(LLM):
         position_ids_1[-1] = 1
         position_ids = torch.stack([position_ids_0, position_ids_1]).view(1, 2, -1)
         return position_ids
-    
-    def export_vocab(self):
-        vocab = self.tokenizer.get_vocab()
-        vocab_list = ['' for i in range(len(vocab))]
-        for k, v in vocab.items():
-            if '<n>' in k: k = '\n'
-            if '<|tab|>' in k: k = '\t'
-            if '<|blank_' in k: k = ' ' * int(k[8:k.find('|>')])
-            if '▁' in k: k = k.replace('▁', ' ')
-            k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
-            vocab_list[v] = k
-        file_path = os.path.join(self.export_path, "Chatglm_6b_vocab.txt")
-        with open(file_path, "w", encoding="utf8") as fp:
-            for v in vocab_list:
-                fp.write(v)
 
 # chatglm2
 class GLM2Block(torch.nn.Module):
@@ -405,19 +431,6 @@ class Chatglm2_6b(LLM):
             return torch.tensor([self.token_len], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
 
-    def export_vocab(self):
-        vocab = self.tokenizer.get_vocab()
-        # 65024 is padding size > len(vocab)
-        vocab_list = ['<' + str(i) + '>\n' for i in range(65024)]
-        for k, v in vocab.items():
-            if '▁' in k: k = k.replace('▁', ' ')
-            k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
-            vocab_list[v] = k
-        file_path = os.path.join(self.export_path, f"{self.model_name}_vocab.txt")
-        with open(file_path, "w", encoding="utf8") as fp:
-            for v in vocab_list:
-                fp.write(v)
-
 # qwen
 class QWENBlock(torch.nn.Module):
     def __init__(self, block, block_id, final_layernorm = None):
@@ -490,13 +503,6 @@ class Qwen_7b_Chat(LLM):
         if self.token_len:
             return torch.tensor([self.seq_len - 1], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
-
-    def export_vocab(self):
-        file_path = os.path.join(self.export_path, "Qwen_7b_vocab.txt")
-        with open(file_path, "w", encoding="utf8") as fp:
-            for k, v in self.tokenizer.mergeable_ranks.items():
-                line = base64.b64encode(k).decode("utf8") + "\n"
-                fp.write(line)
 
 # llama2
 class LLAMA2Block(torch.nn.Module):
@@ -572,19 +578,6 @@ class Llama2_7b_Chat(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
-    def export_vocab(self):
-        vocab = self.tokenizer.get_vocab()
-        vocab_list = ['<' + str(i) + '>\n' for i in range(len(vocab))]
-        for k, v in vocab.items():
-            print(k, v)
-            if '▁' in k: k = k.replace('▁', ' ')
-            k = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
-            vocab_list[v] = k
-        file_path = os.path.join(self.export_path, f"{self.model_name}_vocab.txt")
-        with open(file_path, "w", encoding="utf8") as fp:
-            for v in vocab_list:
-                fp.write(v)
-
 if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
@@ -614,7 +607,7 @@ if __name__ == '__main__':
                         '\n\t- block models.'
                         '\n\t- lm_head model.'
                         )
-    parser.add_argument('--export_vocab', action='store_true', help='export llm vocab to a txt file.')
+    parser.add_argument('--export_token', action='store_true', help='export llm tokenizer to a txt file.')
     parser.add_argument('--export_embed', action='store_true', help='export llm embedding to an `onnx` model.')
     parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
     parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
@@ -646,8 +639,8 @@ if __name__ == '__main__':
     if args.export:
         llm_exporter.export()
 
-    if args.export_vocab:
-        llm_exporter.export_vocab()
+    if args.export_tokenizer:
+        llm_exporter.export_tokenizer()
 
     if args.export_embed or args.export_split:
         llm_exporter.export_embed()
