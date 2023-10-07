@@ -639,7 +639,7 @@ if __name__ == '__main__':
     if args.export:
         llm_exporter.export()
 
-    if args.export_tokenizer:
+    if args.export_token:
         llm_exporter.export_tokenizer()
 
     if args.export_embed or args.export_split:
