@@ -31,7 +31,7 @@ llm-export是一个llm模型导出工具，能够将llm模型导出到onnx模型
 ## 用法
 1. 将该项目clone到本地
 ```sh
-git clnoe git@github.com:wangzhaode/LLMExporter.git
+git clnoe git@github.com:wangzhaode/llm-export.git
 ```
 2. 将需要导出的LLM项目clone到本地，如：chatglm2-6b
 ```sh
