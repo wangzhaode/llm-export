@@ -558,7 +558,7 @@ class Llama2_7b_Chat(LLM):
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
-            "position_ids" : { 0: "seq_len" },
+            "position_ids" : { 1: "seq_len" },
             "past_key_values" : { 4: "history_len" }
         }
 
