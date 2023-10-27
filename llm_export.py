@@ -431,6 +431,15 @@ class Chatglm2_6b(LLM):
             return torch.tensor([self.token_len], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
 
+# chatglm3
+class Chatglm3_6b(Chatglm2_6b):
+    def __init__(self, args):
+        super().__init__(args)
+        self.model_name = 'Chatglm3_6b'
+
+    def build_prompt(self, query):
+        return f'<|user|>\n{query}\n<|assistant|>\n'
+
 # qwen
 class QWENBlock(torch.nn.Module):
     def __init__(self, block, block_id, final_layernorm = None):
@@ -582,6 +591,7 @@ if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
         'chatglm2-6b': Chatglm2_6b,
+        'chatglm3-6b': Chatglm3_6b,
         'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
