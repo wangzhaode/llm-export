@@ -8,6 +8,7 @@ import numpy as np
 import onnxruntime as ort
 import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+import onnx
 
 # some wrapper class for export
 class Embedding(torch.nn.Module):
@@ -276,6 +277,17 @@ class LLM(torch.nn.Module):
                 for k, v in self.tokenizer.mergeable_ranks.items():
                     line = base64.b64encode(k).decode("utf8") + "\n"
                     fp.write(line)
+
+    def verify_load_via_onnx(self):
+        """
+        verify model via onnx checker
+        """
+        print(f'checking exported model via onnx runtime')
+
+        onnx_model = f'./{self.export_path}/llm.onnx'
+        onnx.checker.check_model(onnx_model)
+        print(f'checking finished')
+
 
 # chatglm
 class GLMBlock(torch.nn.Module):
@@ -648,6 +660,7 @@ if __name__ == '__main__':
 
     if args.export:
         llm_exporter.export()
+        llm_exporter.verify_load_via_onnx()
 
     if args.export_token:
         llm_exporter.export_tokenizer()
