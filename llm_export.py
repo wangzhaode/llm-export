@@ -1,14 +1,16 @@
-import os
+import argparse
 import base64
 import glob
+import os
 import shutil
-import argparse
-import torch
+
 import numpy as np
+import onnx
 import onnxruntime as ort
 import sentencepiece as spm
+import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-import onnx
+
 
 # some wrapper class for export
 class Embedding(torch.nn.Module):
