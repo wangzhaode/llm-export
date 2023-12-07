@@ -1,3 +1,4 @@
+MNN==2.8.0
 numpy==1.25.2
 onnxruntime==1.15.1
 torch==2.0.1

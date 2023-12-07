@@ -6,8 +6,32 @@ import argparse
 import torch
 import numpy as np
 import onnxruntime as ort
+import _tools as MNNTools
 import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data = False):
+    model_name, model_extension = os.path.splitext(os.path.basename(onnx_path))
+    if model_extension != '.onnx':
+        return
+    mnn_name = model_name + '.mnn'
+    mnn_path = os.path.join(mnn_dir, mnn_name)
+    convert_args = [
+        '',
+        '-f',
+        'ONNX',
+        '--modelFile',
+        str(onnx_path),
+        '--MNNModel',
+        str(mnn_path),
+        '--weightQuantBits',
+        str(quant_bit)
+    ]
+    if asymmetric:
+        convert_args.append("--weightQuantAsymmetric")
+    if external_data:
+        convert_args.append("--saveExternalData")
+    MNNTools.mnnconvert(convert_args)
 
 # some wrapper class for export
 class Embedding(torch.nn.Module):
@@ -44,7 +68,13 @@ class LLM(torch.nn.Module):
 
     def __init__(self, args):
         super().__init__()
-        self.export_path = args.export_path
+        self.onnx_path = args.onnx_path
+        self.mnn_path = args.mnn_path
+        if not os.path.exists(self.onnx_path):
+            os.makedirs(self.onnx_path)
+        if not os.path.exists(self.mnn_path):
+            os.makedirs(self.mnn_path)
+        self.export_mnn = args.export_mnn
         self.export_verbose = args.export_verbose
         self.export_test = args.export_test
         self.embed_bf16 = args.embed_bf16
@@ -134,7 +164,7 @@ class LLM(torch.nn.Module):
     def export_lm(self):
         model = self.lm
         hidden_states = torch.randn(1, self.hidden_size)
-        onnx_model = f'./{self.export_path}/lm.onnx'
+        onnx_model = f'./{self.onnx_path}/lm.onnx'
         torch.onnx.export(model, (hidden_states),
                         onnx_model,
                         verbose=self.export_verbose,
@@ -151,11 +181,13 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
     def export_embed(self):
         model = self.embed
         input_ids = torch.arange(3, dtype=torch.long)
-        onnx_model = f'./{self.export_path}/embedding.onnx'
+        onnx_model = f'./{self.onnx_path}/embedding.onnx'
         torch.onnx.export(model, (input_ids),
                         onnx_model,
                         verbose=self.export_verbose,
@@ -175,6 +207,8 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
     def export_block(self, block_id: int):
         self.seq_len = 3
@@ -184,7 +218,7 @@ class LLM(torch.nn.Module):
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape[1:])
         model = self.blocks[block_id]
-        onnx_model = f'./{self.export_path}/block_{block_id}.onnx'
+        onnx_model = f'./{self.onnx_path}/block_{block_id}.onnx'
         torch.onnx.export(
             model, (inputs_embeds, attention_mask, position_ids, past_key_values),
             onnx_model,
@@ -207,6 +241,8 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
     def export_blocks(self):
         for i in range(self.block_nums):
@@ -220,7 +256,7 @@ class LLM(torch.nn.Module):
         attention_mask =  self.get_attention_mask()
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape)
-        onnx_model = f'./{self.export_path}/llm.onnx'
+        onnx_model = f'./{self.onnx_path}/llm.onnx'
         torch.onnx.export(
             model, (input_ids, attention_mask, position_ids, past_key_values),
             onnx_model,
@@ -244,9 +280,12 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            # single model is > 2G, using external_data
+            onnx2mnn(onnx_model, self.mnn_path, 4, True, True)
 
     def export_tokenizer(self):
-        file_path = os.path.join(self.export_path, "tokenizer.txt")
+        file_path = os.path.join(self.onnx_path, "tokenizer.txt")
         if self.sp_model is not None:
             # senetencepiece
             NORMAL = 1; UNKNOWN = 2; CONTROL = 3
@@ -644,7 +683,9 @@ if __name__ == '__main__':
                         help='type(`str`, *optional*):'
                         '\n\tThe pretrain llm model type.'
                         )
-    parser.add_argument('--export_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
+    parser.add_argument('--onnx_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
+    parser.add_argument('--mnn_path', type=str, default='./mnn', help='export mnn model path, defaut is `./mnn`.')
+    parser.add_argument('--export_mnn', action='store_true', default=False, help='Whether or not to export mnn model after onnx.')
     parser.add_argument('--export_verbose', action='store_true', default=False, help='Whether or not to export onnx with verbose.')
     parser.add_argument('--export_test', action='store_true', help='Whether or not to export onnx with test using onnxruntime.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
