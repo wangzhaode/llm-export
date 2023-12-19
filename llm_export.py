@@ -68,6 +68,8 @@ class LLM(torch.nn.Module):
 
     def __init__(self, args):
         super().__init__()
+        self.quant_bit = 4
+        self.asymmetric = True
         self.onnx_path = args.onnx_path
         self.mnn_path = args.mnn_path
         if not os.path.exists(self.onnx_path):
@@ -182,7 +184,7 @@ class LLM(torch.nn.Module):
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
         if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path)
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
 
     def export_embed(self):
         model = self.embed
@@ -311,12 +313,25 @@ class LLM(torch.nn.Module):
                 token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
                 fp.write(f'{token_encode} {score} {type}\n')
             fp.close()
-        else:
+        elif hasattr(self.tokenizer, 'mergeable_ranks'):
             # tikton
             with open(file_path, "w", encoding="utf8") as fp:
                 for k, v in self.tokenizer.mergeable_ranks.items():
                     line = base64.b64encode(k).decode("utf8") + "\n"
                     fp.write(line)
+        else:
+            # other
+            with open(file_path, "w", encoding="utf8") as fp:
+                vocab = self.tokenizer.get_vocab()
+                vocab_list = ['<unk>' for i in range(len(vocab))]
+                for k, v in vocab.items():
+                    k = k.replace('Ċ', '\n')
+                    k = k.replace('Ġ', ' ')
+                    vocab_list[int(v)] = k
+                for v in vocab_list:
+                    line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
+                    fp.write(line)
+
 
 # chatglm
 class GLMBlock(torch.nn.Module):
@@ -405,6 +420,7 @@ class GLM2Block(torch.nn.Module):
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.hidden_size = 4096
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
         theta = 1.0 / (10000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
@@ -447,7 +463,7 @@ class Chatglm2_6b(LLM):
         self.lm = Lm(self.lm_)
         self.blocks = [GLM2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
-        self.past_kv_shape = [28, 2, 0, 1, 2, 128]
+        self.past_kv_shape = [len(self.blocks), 1, 0, 2, 32, 80]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
@@ -663,6 +679,78 @@ class Llama2_7b_Chat(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
+class PHI2Block(torch.nn.Module):
+    def __init__(self, block, block_id, hidden_size):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        theta = 1.0 / (10000 ** (torch.arange(0, 32, 2, dtype=torch.float32) / 32))
+        position_ids = position_ids.float().reshape(-1, 1)
+        idx_theta = position_ids * theta
+        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=0).contiguous()
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
+        hidden_states, presents = self.block(hidden_states,
+                                             past_kv,
+                                             rotary_pos_emb=rotary_pos_emb,
+                                             causal_mask=attention_mask
+                                             )
+        if self.block_id == 31:
+            hidden_states = hidden_states[:, -1, :]
+        return hidden_states, presents
+
+class phi_2(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+        self.model_name = 'phi-2'
+        self.asymmetric = False # TODO: some precision bug when using asymmetric
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        transformer = model.transformer
+        self.lm_ = model.lm_head
+        self.embed_ = transformer.embd.wte
+        self.hidden_size = self.embed_.weight.shape[-1]
+        self.blocks_ = transformer.h
+        # self.final_layernorm_ = transformer.final_layernorm
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        self.block_nums = len(self.blocks_)
+        self.embed = Embedding(self.embed_, self.embed_bf16)
+        self.lm = Lm(self.lm_)
+        self.blocks = [PHI2Block(self.blocks_[i], i, self.hidden_size) for i in range(self.block_nums)]
+        # some config for export
+        self.past_kv_shape = [len(self.blocks), 1, 0, 2, 32, 80]
+        self.block_dynamic_axes = {
+            "inputs_embeds" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 1: "history_len" }
+        }
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 2: "history_len" }
+        }
+
+    def build_prompt(self, query):
+            return f'Instruct: {query}\nOutput:'
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.zeros([1, 1, 1, 1]).bool()
+        attention_mask = ~torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]).bool())
+        return attention_mask
+
+    def get_position_ids(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+
 if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
@@ -672,7 +760,8 @@ if __name__ == '__main__':
         'Qwen-7B-Chat': Qwen_7b_Chat,
         'Qwen-1_8B-Chat': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
-        'Llama-2-7b-chat-ms': Llama2_7b_Chat
+        'Llama-2-7b-chat-ms': Llama2_7b_Chat,
+        'phi-2': phi_2
     }
     parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
