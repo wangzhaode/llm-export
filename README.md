@@ -1,6 +1,8 @@
 # llm-export
 
-llm-export是一个llm模型导出工具，能够将llm模型导出到onnx模型。
+[English](./README_en.md)
+
+llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn模型。
 
 - 🚀 均完成`onnxruntime`正确性测试
 - 🚀 优化原始代码，支持动态形状
