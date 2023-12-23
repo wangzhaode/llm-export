@@ -633,6 +633,8 @@ class Llama2_7b_Chat(LLM):
         self.model_name = 'Llama2_7b'
         if 'Baichuan2' in args.path:
             self.model_name = 'Baichuan2_7B'
+        if 'internlm' in args.path:
+            self.model_name = 'Internlm_7b'
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -666,6 +668,8 @@ class Llama2_7b_Chat(LLM):
     def build_prompt(self, query):
         if 'Baichuan2' in self.model_name:
             return f'<reserved_106>{query}<reserved_107>'
+        if 'Internlm_7b' in self.model_name:
+            return f'<|User|>:{query}<eoh>\n<|Bot|>:'
         return f'[INST]{query}[/INST]'
 
 
@@ -679,6 +683,7 @@ class Llama2_7b_Chat(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
+# phi-2
 class PHI2Block(torch.nn.Module):
     def __init__(self, block, block_id, hidden_size):
         super().__init__()
@@ -761,7 +766,7 @@ if __name__ == '__main__':
         'Qwen-1_8B-Chat': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
-        'phi-2': phi_2
+        'internlm-chat-7b': Llama2_7b_Chat
     }
     parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
