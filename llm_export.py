@@ -499,8 +499,9 @@ class Chatglm3_6b(Chatglm2_6b):
 
 # qwen
 class QWENBlock(torch.nn.Module):
-    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
+    def __init__(self, name, block, block_id, hidden_size, final_layernorm = None):
         super().__init__()
+        self.name = name
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
@@ -512,11 +513,13 @@ class QWENBlock(torch.nn.Module):
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
         rotary_pos_emb = rotary_pos_emb.unsqueeze(1).unsqueeze(0)
+        if self.name != 'Qwen-7B':
+            rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
-        hidden_states, presents = self.block(hidden_states,
-                                             past_kv,
-                                             attention_mask,
-                                             rotary_pos_emb,
+        hidden_states, presents = self.block(hidden_states=hidden_states,
+                                             layer_past=past_kv,
+                                             attention_mask=attention_mask,
+                                             rotary_pos_emb=rotary_pos_emb,
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
@@ -552,13 +555,19 @@ class QWEN18Block(torch.nn.Module):
             presents = torch.stack(presents)
         return hidden_states, presents
 
-class Qwen_7b_Chat(LLM):
+class Qwen_Chat(LLM):
     def __init__(self, args):
         super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        # Qwen models
+        self.model_name = 'Qwen-7B'
+        if '1_8' in model_path:
+            self.model_name = 'Qwen-1_8b'
+        if 'VL' in model_path:
+            self.model_name = 'Qwen-VL'
         transformer = model.transformer
         self.lm_ = model.lm_head
         self.embed_ = transformer.wte
@@ -570,13 +579,12 @@ class Qwen_7b_Chat(LLM):
         self.hidden_size = transformer.embed_dim
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
+        self.blocks = [QWENBlock(self.model_name, self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         if self.block_nums == 32:
-            # qwen-7b
-            self.blocks = [QWENBlock(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+            # qwen-7b, qwen-vl
             self.past_kv_shape = [32, 2, 1, 0, 32, 128]
         elif self.block_nums == 24:
             # qwen-1.8b
-            self.blocks = [QWEN18Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
             self.past_kv_shape = [24, 2, 1, 0, 16, 128]
         # some config for export
         self.block_dynamic_axes = {
@@ -596,6 +604,10 @@ class Qwen_7b_Chat(LLM):
         return f'\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
 
     def get_attention_mask(self) -> torch.Tensor:
+        if self.model_name == 'Qwen-VL':
+            if self.token_len:
+                return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+            return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
         if self.token_len:
             return torch.ones([1, 1, 1, 1]).bool()
         return torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]).bool())
@@ -604,7 +616,7 @@ class Qwen_7b_Chat(LLM):
         if self.token_len:
             return torch.tensor([self.seq_len - 1], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
-
+        
 # llama2
 class LLAMA2Block(torch.nn.Module):
     def __init__(self, block, block_id, final_layernorm = None):
@@ -762,8 +774,9 @@ if __name__ == '__main__':
         'chatglm2-6b': Chatglm2_6b,
         'chatglm3-6b': Chatglm3_6b,
         'codegeex2-6b': Chatglm2_6b,
-        'Qwen-7B-Chat': Qwen_7b_Chat,
-        'Qwen-1_8B-Chat': Qwen_7b_Chat,
+        'Qwen-7B-Chat': Qwen_Chat,
+        'Qwen-1_8B-Chat': Qwen_Chat,
+        'Qwen-VL-Chat': Qwen_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat
