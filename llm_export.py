@@ -87,6 +87,7 @@ class LLM(torch.nn.Module):
             self.sp_model = None
         self.max_length = 1024
         self.hidden_size = 4096
+        self.visual = None # defualt is not visual
         self.load_model(args.path)
 
     def load_model(self, model_path: str):
@@ -101,8 +102,15 @@ class LLM(torch.nn.Module):
     def export_vocab(self):
         raise NotImplementedError
 
+    def visual_embed(self, input_ids):
+        raise NotImplementedError
+
     def forward(self, input_ids, attention_mask, position_ids, past_key_values):
-        hidden_states = self.embed(input_ids)
+        if self.visual is not None and past_key_values[0] is None:
+            hidden_states = self.visual_embed(input_ids)
+        else:
+            hidden_states = self.embed(input_ids)
+        print(input_ids)
         presents = []
         for i in range(self.block_nums):
             hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])
@@ -185,6 +193,34 @@ class LLM(torch.nn.Module):
             self.assert_equal(original_outs, onnx_outs)
         if self.export_mnn:
             onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
+
+    def export_visual(self):
+        if self.visual is None:
+            return
+        input_images = torch.randn((1, 3, self.image_size, self.image_size))
+        model = self.visual
+        onnx_model = f'./{self.onnx_path}/visual.onnx'
+        torch.onnx.export(model, (input_images),
+                        onnx_model,
+                        verbose=self.export_verbose,
+                        input_names=['input_images'],
+                        output_names=['image_embeds'],
+                        dynamic_axes={"input_images": {
+                            0: "size"
+                        }},
+                        do_constant_folding=True,
+                        opset_version=15)
+        # test
+        if self.export_test:
+            original_outs = model(input_images)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'input_images' : input_images.numpy(),
+            }
+            onnx_outs = ort_session.run(None, inputs)[0]
+            self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
     def export_embed(self):
         model = self.embed
@@ -573,6 +609,10 @@ class Qwen_Chat(LLM):
         self.embed_ = transformer.wte
         self.blocks_ = transformer.h
         self.final_layernorm_ = transformer.ln_f
+        if hasattr(transformer, 'visual'):
+            self.visual = transformer.visual
+            self.image_start_id = transformer.config.visual['image_start_id']
+            self.image_size = transformer.config.visual['image_size']
         # some wrapper
         self.stop_id = self.tokenizer.im_end_id
         self.block_nums = len(self.blocks_)
@@ -616,7 +656,24 @@ class Qwen_Chat(LLM):
         if self.token_len:
             return torch.tensor([self.seq_len - 1], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
-        
+
+    def visual_embed(self, input_ids):
+        if not torch.any(input_ids == self.image_start_id):
+            return self.embed(input_ids)
+        bos_pos = torch.where(input_ids == self.image_start_id)
+        eos_pos = torch.where(input_ids == self.image_start_id + 1)
+        img_pos = torch.stack((bos_pos[0], bos_pos[1], eos_pos[1]), dim=1)
+        images = []
+        for i, a, b in img_pos:
+            image = input_ids[i][a + 1 : b - 1].tolist()
+            image = image[ : image.index(self.image_start_id + 2)]
+            images.append(bytes(image).decode('utf-8'))
+        images = self.visual.encode(images)
+        hidden_states = self.embed(input_ids).view(1, -1, self.hidden_size)
+        for idx, (i, a, b) in enumerate(img_pos):
+            hidden_states[i][a + 1 : b] = images[idx]
+        return hidden_states.view(-1, 1, self.hidden_size)
+
 # llama2
 class LLAMA2Block(torch.nn.Module):
     def __init__(self, block, block_id, final_layernorm = None):
@@ -805,6 +862,7 @@ if __name__ == '__main__':
                         )
     parser.add_argument('--export_token', action='store_true', help='export llm tokenizer to a txt file.')
     parser.add_argument('--export_embed', action='store_true', help='export llm embedding to an `onnx` model.')
+    parser.add_argument('--export_visual', action='store_true', help='export llm visual model to an `onnx` model.')
     parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
     parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
     parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
@@ -840,6 +898,9 @@ if __name__ == '__main__':
 
     if args.export_embed or args.export_split:
         llm_exporter.export_embed()
+
+    if args.export_visual or args.export_split:
+        llm_exporter.export_visual()
 
     if args.export_lm or args.export_split:
         llm_exporter.export_lm()
