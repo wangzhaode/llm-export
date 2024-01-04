@@ -499,7 +499,7 @@ class Chatglm2_6b(LLM):
         self.lm = Lm(self.lm_)
         self.blocks = [GLM2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
-        self.past_kv_shape = [len(self.blocks), 1, 0, 2, 32, 80]
+        self.past_kv_shape = [28, 2, 0, 1, 2, 128]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
