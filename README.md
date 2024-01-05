@@ -70,6 +70,7 @@ python llm_export.py \
 - 支持导出模型的Embedding层为一个onnx模型，使用`--export_embed`，同时支持bf16格式，使用`--embed_bf16`
 - 支持分层导出模型的block，使用`--export_blocks`导出全部层；使用`--export_block $id`导出指定层
 - 支持导出模型的lm_head层为一个onnx模型，使用`--export_lm`
+- 支持导出多模态模型的visual模型为一个onnx模型，使用`--export_viusal`
 - 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
 - 支持在导出onnx模型后使用onnxruntime对结果一致性进行校验，使用`--export_test`
 - 支持将tokenizer导出为文本文件，使用`--export_token`
@@ -78,21 +79,21 @@ python llm_export.py \
 
 ## 参数
 ```
-usage: llm_export.py [-h] --path PATH [--type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms}]
-                     [--onnx_path ONNX_PATH] [--mnn_path MNN_PATH] [--export_mnn] [--export_verbose] [--export_test] [--test TEST] [--export] [--export_split] [--export_token]
-                     [--export_embed] [--export_lm] [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bf16]
+usage: llm_export.py [-h] --path PATH [--type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b}] [--onnx_path ONNX_PATH]
+                     [--mnn_path MNN_PATH] [--export_mnn] [--export_verbose] [--export_test] [--test TEST] [--export] [--export_split] [--export_token] [--export_embed] [--export_visual] [--export_lm]
+                     [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bf16]
 
-LLMExporter
+llm_exporter
 
 optional arguments:
   -h, --help            show this help message and exit
   --path PATH           path(`str` or `os.PathLike`):
                         Can be either:
-                        	- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
-                        	- A path to a *directory* clone from repo like `../chatglm-6b`.
-  --type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms}
+                                - A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
+                                - A path to a *directory* clone from repo like `../chatglm-6b`.
+  --type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b}
                         type(`str`, *optional*):
-                        	The pretrain llm model type.
+                                The pretrain llm model type.
   --onnx_path ONNX_PATH
                         export onnx model path, defaut is `./onnx`.
   --mnn_path MNN_PATH   export mnn model path, defaut is `./mnn`.
@@ -102,11 +103,12 @@ optional arguments:
   --test TEST           test model inference with query `TEST`.
   --export              export model to an `onnx` model.
   --export_split        export model split to some `onnx` models:
-                        	- embedding model.
-                        	- block models.
-                        	- lm_head model.
+                                - embedding model.
+                                - block models.
+                                - lm_head model.
   --export_token        export llm tokenizer to a txt file.
   --export_embed        export llm embedding to an `onnx` model.
+  --export_visual       export llm visual model to an `onnx` model.
   --export_lm           export llm lm_head to an `onnx` model.
   --export_block EXPORT_BLOCK
                         export llm block [id] to an `onnx` model.

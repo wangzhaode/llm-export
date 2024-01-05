@@ -838,7 +838,7 @@ if __name__ == '__main__':
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat
     }
-    parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
                         help='path(`str` or `os.PathLike`):\nCan be either:'
                         '\n\t- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]'
