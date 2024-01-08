@@ -110,7 +110,6 @@ class LLM(torch.nn.Module):
             hidden_states = self.visual_embed(input_ids)
         else:
             hidden_states = self.embed(input_ids)
-        print(input_ids)
         presents = []
         for i in range(self.block_nums):
             hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])

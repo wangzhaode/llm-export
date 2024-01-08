@@ -70,7 +70,7 @@ python llm_export.py \
 - 支持导出模型的Embedding层为一个onnx模型，使用`--export_embed`，同时支持bf16格式，使用`--embed_bf16`
 - 支持分层导出模型的block，使用`--export_blocks`导出全部层；使用`--export_block $id`导出指定层
 - 支持导出模型的lm_head层为一个onnx模型，使用`--export_lm`
-- 支持导出多模态模型的visual模型为一个onnx模型，使用`--export_viusal`
+- 支持导出多模态模型的visual模型为一个onnx模型，使用`--export_visual`
 - 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
 - 支持在导出onnx模型后使用onnxruntime对结果一致性进行校验，使用`--export_test`
 - 支持将tokenizer导出为文本文件，使用`--export_token`
