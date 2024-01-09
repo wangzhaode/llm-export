@@ -824,6 +824,109 @@ class phi_2(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
+class BGEBlock(torch.nn.Module):
+    def __init__(self, block, block_id, hidden_size):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask):
+        hidden_states = self.block(hidden_states, attention_mask)[0]
+        return hidden_states
+
+class bge(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+        self.model_name = 'bert'
+
+    def forward(self, input_ids, position_ids, attention_mask):
+        input_ids = input_ids.view(1, -1)
+        token_type_ids = (1 - attention_mask).view(1, -1)
+        hidden_states = self.embed(input_ids, token_type_ids, position_ids)[0].unsqueeze(0)
+        for i in range(self.block_nums):
+            hidden_states = self.blocks[i](hidden_states, attention_mask)
+        # hidden_states = self.lm(hidden_states) # sentence_embeddings not need
+        sentence_embeddings = hidden_states[:, 0]
+        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
+
+    def response(self, query):
+        self.eval()
+        input_ids = self.tokenizer(query)['input_ids']
+        self.seq_len = len(input_ids)
+        input_ids = torch.tensor(input_ids)
+        position_ids = self.get_position_ids()
+        attention_mask = self.get_attention_mask()
+        res = self.forward(input_ids, position_ids, attention_mask)
+        print(res)
+        return res
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        transformer = model.encoder
+        self.lm_ = model.pooler
+        self.embed_ = model.embeddings
+        self.hidden_size = self.embed_.word_embeddings.weight.shape[-1]
+        self.blocks_ = transformer.layer
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        self.block_nums = len(self.blocks_)
+        self.embed = self.embed_
+        self.lm = self.lm_
+        self.blocks = [BGEBlock(self.blocks_[i], i, self.hidden_size) for i in range(self.block_nums)]
+        # some config for export
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "position_ids" : { 1: "seq_len" },
+            "attention_mask" : { 3: "seq_len" }
+        }
+
+    def export(self):
+        model = self.eval()
+        self.seq_len = 3
+        input_ids = torch.arange(3, dtype=torch.long)
+        position_ids = self.get_position_ids()
+        attention_mask = self.get_attention_mask()
+        onnx_model = f'./{self.onnx_path}/bge.onnx'
+        torch.onnx.export(
+            model, (input_ids, position_ids, attention_mask),
+            onnx_model,
+            verbose=self.export_verbose,
+            input_names=[
+                'input_ids',
+                'position_ids',
+                'attention_mask'
+            ],
+            output_names=['sentence_embeddings'],
+            dynamic_axes=self.model_dynamic_axes,
+            do_constant_folding=True,
+            opset_version=15)
+        if self.export_test:
+            self.seq_len = 4
+            position_ids = self.get_position_ids()
+            input_ids = torch.tensor([ 101,  872, 1962,  102 ], dtype=torch.long)
+            attention_mask = self.get_attention_mask()
+            # test
+            original_outs = model(input_ids, position_ids, attention_mask)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'input_ids' : input_ids.detach().numpy(),
+                'position_ids' : position_ids.detach().numpy(),
+                'attention_mask' : attention_mask.detach().numpy()
+            }
+            onnx_outs = ort_session.run(None, inputs)[0]
+            self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path, 4, True)
+
+    def get_position_ids(self) -> torch.Tensor:
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+
+    def get_attention_mask(self) -> torch.Tensor:
+        return torch.ones([1, 1, 1, self.seq_len], dtype=torch.long)
+
 if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
@@ -835,7 +938,9 @@ if __name__ == '__main__':
         'Qwen-VL-Chat': Qwen_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
-        'internlm-chat-7b': Llama2_7b_Chat
+        'internlm-chat-7b': Llama2_7b_Chat,
+        'phi-2': phi_2,
+        'bge-large-zh': bge
     }
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
