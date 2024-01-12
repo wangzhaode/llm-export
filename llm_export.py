@@ -10,7 +10,7 @@ import _tools as MNNTools
 import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data = False):
+def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data = False, bizCode : str= None):
     model_name, model_extension = os.path.splitext(os.path.basename(onnx_path))
     if model_extension != '.onnx':
         return
@@ -25,12 +25,15 @@ def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data
         '--MNNModel',
         str(mnn_path),
         '--weightQuantBits',
-        str(quant_bit)
+        str(quant_bit),
     ]
     if asymmetric:
         convert_args.append("--weightQuantAsymmetric")
     if external_data:
         convert_args.append("--saveExternalData")
+    if bizCode is not None:
+        convert_args.append("--bizCode")
+        convert_args.append(str(bizCode))
     MNNTools.mnnconvert(convert_args)
 
 # some wrapper class for export
@@ -354,6 +357,10 @@ class LLM(torch.nn.Module):
                 for k, v in self.tokenizer.mergeable_ranks.items():
                     line = base64.b64encode(k).decode("utf8") + "\n"
                     fp.write(line)
+                if hasattr(self.tokenizer, 'special_tokens'):
+                    for k, v in self.tokenizer.special_tokens.items():
+                        line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
+                        fp.write(line)
         else:
             # other
             with open(file_path, "w", encoding="utf8") as fp:
@@ -918,8 +925,15 @@ class bge(LLM):
             }
             onnx_outs = ort_session.run(None, inputs)[0]
             self.assert_equal(original_outs, onnx_outs)
+
+        token_str = None
+        if False: # save tokenizer in mnn
+            self.export_tokenizer()
+            token_path = os.path.join(self.onnx_path, "tokenizer.txt")
+            token_str = open(token_path, 'rt').read()
+
         if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path, 4, True)
+            onnx2mnn(onnx_model, self.mnn_path, 4, True, token_str=token_str)
 
     def get_position_ids(self) -> torch.Tensor:
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
