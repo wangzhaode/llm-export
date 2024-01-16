@@ -72,7 +72,8 @@ class LLM(torch.nn.Module):
     def __init__(self, args):
         super().__init__()
         self.quant_bit = 4
-        self.asymmetric = True
+        self.asymmetric_lm = True
+        self.asymmetric_block = True
         self.onnx_path = args.onnx_path
         self.mnn_path = args.mnn_path
         if not os.path.exists(self.onnx_path):
@@ -194,7 +195,7 @@ class LLM(torch.nn.Module):
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
         if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric_lm)
 
     def export_visual(self):
         if self.visual is None:
@@ -282,7 +283,7 @@ class LLM(torch.nn.Module):
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
         if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path)
+            onnx2mnn(onnx_model, self.mnn_path, asymmetric=self.asymmetric_block)
 
     def export_blocks(self):
         for i in range(self.block_nums):
@@ -785,7 +786,7 @@ class phi_2(LLM):
     def __init__(self, args):
         super().__init__(args)
         self.model_name = 'phi-2'
-        self.asymmetric = False # TODO: some precision bug when using asymmetric
+        self.asymmetric_block = False # TODO: some precision bug when using asymmetric
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
