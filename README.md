@@ -19,6 +19,9 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 - [![Download][download-llama2-7b-chat-onnx]][release-llama2-7b-chat-onnx]
 - [![Download][download-qwen-1.8b-chat-onnx]][release-qwen-1.8b-chat-onnx]
 - [![Download][download-phi-2-onnx]][release-phi-2-onnx]
+- [![Download][download-internlm-7b-onnx]][release-internlm-7b-onnx]
+- [![Download][download-qwen-vl-onnx]][release-qwen-vl-onnx]
+- [![Download][download-bge-large-zh-onnx]][release-bge-large-zh-onnx]
 
 [download-chatglm-6b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/chatglm-6b-onnx/total
 [download-chatglm2-6b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/chatglm2-6b-onnx/total
@@ -29,6 +32,9 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 [download-llama2-7b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/llama2-7b-chat-onnx/total
 [download-qwen-1.8b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/qwen-1.8b-onnx/total
 [download-phi-2-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/phi-2-onnx/total
+[download-internlm-7b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/internlm-7b-onnx/total
+[download-qwen-vl-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/qwen-vl-onnx/total
+[download-bge-large-zh-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/bge-large-zh-onnx/total
 [release-chatglm-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm-6b-onnx
 [release-chatglm2-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm2-6b-onnx
 [release-chatglm3-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm3-6b-onnx
@@ -38,6 +44,9 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 [release-llama2-7b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/llama2-7b-chat-onnx
 [release-qwen-1.8b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/qwen-1.8b-onnx
 [release-phi-2-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/phi-2-onnx
+[release-internlm-7b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/internlm-7b-onnx
+[release-qwen-vl-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/qwen-vl-onnx
+[release-bge-large-zh-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/bge-large-zh-onnx
 
 ## 用法
 1. 将该项目clone到本地

@@ -282,7 +282,7 @@ class LLM(torch.nn.Module):
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
         if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path)
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
 
     def export_blocks(self):
         for i in range(self.block_nums):
@@ -322,7 +322,7 @@ class LLM(torch.nn.Module):
             self.assert_equal(original_outs, onnx_outs)
         if self.export_mnn:
             # single model is > 2G, using external_data
-            onnx2mnn(onnx_model, self.mnn_path, 4, True, True)
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric, True)
 
     def export_tokenizer(self):
         file_path = os.path.join(self.onnx_path, "tokenizer.txt")
@@ -933,7 +933,7 @@ class bge(LLM):
             token_str = open(token_path, 'rt').read()
 
         if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path, 4, True, token_str=token_str)
+            onnx2mnn(onnx_model, self.mnn_path, 8, True, bizCode=token_str)
 
     def get_position_ids(self) -> torch.Tensor:
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
