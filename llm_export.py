@@ -682,14 +682,15 @@ class Qwen_Chat(LLM):
 
 # llama2
 class LLAMA2Block(torch.nn.Module):
-    def __init__(self, block, block_id, final_layernorm = None):
+    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.hidden_size = hidden_size
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
-        hidden_states = hidden_states.view(1, -1, 4096)
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
         hidden_states, presents = self.block(hidden_states,
                                              attention_mask,
                                              position_ids,
@@ -697,7 +698,7 @@ class LLAMA2Block(torch.nn.Module):
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
@@ -710,6 +711,8 @@ class Llama2_7b_Chat(LLM):
             self.model_name = 'Baichuan2_7B'
         if 'internlm' in args.path:
             self.model_name = 'Internlm_7b'
+        if 'TinyLlama' in args.path:
+            self.model_name = 'TinyLlama'
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -720,13 +723,16 @@ class Llama2_7b_Chat(LLM):
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.norm
         # some wrapper
+        self.hidden_size = self.embed_.weight.shape[-1]
         self.stop_id = self.tokenizer.eos_token_id
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.past_kv_shape = [32, 2, 1, 32, 0, 128]
+        if self.block_nums == 22:
+            self.past_kv_shape = [22, 2, 1, 4, 0, 64]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
@@ -745,6 +751,8 @@ class Llama2_7b_Chat(LLM):
             return f'<reserved_106>{query}<reserved_107>'
         if 'Internlm_7b' in self.model_name:
             return f'<|User|>:{query}<eoh>\n<|Bot|>:'
+        if 'TinyLlama' in self.model_name:
+            return f'<s><|system|>\nYou are a friendly chatbot who always responds in the style of a pirate</s>\n<|user|>\n{query}</s>\n<|assistant|>\n'
         return f'[INST]{query}[/INST]'
 
 
@@ -866,7 +874,6 @@ class bge(LLM):
         position_ids = self.get_position_ids()
         attention_mask = self.get_attention_mask()
         res = self.forward(input_ids, position_ids, attention_mask)
-        print(res)
         return res
 
     def load_model(self, model_path: str):
@@ -953,6 +960,7 @@ if __name__ == '__main__':
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat,
+        'TinyLlama-1_1B-Chat': Llama2_7b_Chat,
         'phi-2': phi_2,
         'bge-large-zh': bge
     }
