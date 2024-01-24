@@ -88,6 +88,7 @@ class LLM(torch.nn.Module):
             self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
         else:
             self.sp_model = None
+        self.stop_ids = []
         self.max_length = 1024
         self.hidden_size = 4096
         self.visual = None # defualt is not visual
@@ -152,7 +153,7 @@ class LLM(torch.nn.Module):
             attention_mask = self.get_attention_mask()
             position_ids = self.get_position_ids()
             token_id, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
-            if token_id == self.stop_id:
+            if token_id == self.stop_id or token_id in self.stop_ids:
                 print("", end='\n')
                 break
             word = self.id_to_str(token_id)
@@ -705,7 +706,6 @@ class LLAMA2Block(torch.nn.Module):
 
 class Llama2_7b_Chat(LLM):
     def __init__(self, args):
-        super().__init__(args)
         self.model_name = 'Llama2_7b'
         if 'Baichuan2' in args.path:
             self.model_name = 'Baichuan2_7B'
@@ -713,6 +713,9 @@ class Llama2_7b_Chat(LLM):
             self.model_name = 'Internlm_7b'
         if 'TinyLlama' in args.path:
             self.model_name = 'TinyLlama'
+        if 'Yi' in args.path:
+            self.model_name = 'Yi'
+        super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -725,12 +728,17 @@ class Llama2_7b_Chat(LLM):
         # some wrapper
         self.hidden_size = self.embed_.weight.shape[-1]
         self.stop_id = self.tokenizer.eos_token_id
+        if hasattr(model, 'generation_config'):
+            self.stop_ids.append(self.stop_id)
+            self.stop_ids.append(model.generation_config.eos_token_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
         self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.past_kv_shape = [32, 2, 1, 32, 0, 128]
+        if 'Yi' in self.model_name:
+            self.past_kv_shape = [32, 2, 1, 4, 0, 128]
         if self.block_nums == 22:
             self.past_kv_shape = [22, 2, 1, 4, 0, 64]
         self.block_dynamic_axes = {
@@ -753,6 +761,8 @@ class Llama2_7b_Chat(LLM):
             return f'<|User|>:{query}<eoh>\n<|Bot|>:'
         if 'TinyLlama' in self.model_name:
             return f'<s><|system|>\nYou are a friendly chatbot who always responds in the style of a pirate</s>\n<|user|>\n{query}</s>\n<|assistant|>\n'
+        if 'Yi' in self.model_name:
+            return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
         return f'[INST]{query}[/INST]'
 
 
@@ -839,6 +849,7 @@ class phi_2(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
+# BGE is Embedding Model based Bert
 class BGEBlock(torch.nn.Module):
     def __init__(self, block, block_id, hidden_size):
         super().__init__()
@@ -853,7 +864,7 @@ class BGEBlock(torch.nn.Module):
 class bge(LLM):
     def __init__(self, args):
         super().__init__(args)
-        self.model_name = 'bert'
+        self.model_name = 'bge-large-zh'
 
     def forward(self, input_ids, position_ids, attention_mask):
         input_ids = input_ids.view(1, -1)
@@ -961,6 +972,7 @@ if __name__ == '__main__':
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat,
         'TinyLlama-1_1B-Chat': Llama2_7b_Chat,
+        'Yi-6B-Chat': Llama2_7b_Chat,
         'phi-2': phi_2,
         'bge-large-zh': bge
     }
