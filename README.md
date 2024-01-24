@@ -23,6 +23,7 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 - [![Download][download-qwen-vl-onnx]][release-qwen-vl-onnx]
 - [![Download][download-bge-large-zh-onnx]][release-bge-large-zh-onnx]
 - [![Download][download-tinyllama-1.1b-chat-onnx]][release-tinyllama-1.1b-chat-onnx]
+- [![Download][download-yi-6b-chat-onnx]][release-yi-6b-chat-onnx]
 
 [download-chatglm-6b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/chatglm-6b-onnx/total
 [download-chatglm2-6b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/chatglm2-6b-onnx/total
@@ -37,6 +38,7 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 [download-qwen-vl-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/qwen-vl-onnx/total
 [download-bge-large-zh-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/bge-large-zh-onnx/total
 [download-tinyllama-1.1b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/tinyllama-1.1b-chat-onnx/total
+[download-yi-6b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/yi-6b-chat-onnx/total
 [release-chatglm-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm-6b-onnx
 [release-chatglm2-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm2-6b-onnx
 [release-chatglm3-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm3-6b-onnx
@@ -50,6 +52,7 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 [release-qwen-vl-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/qwen-vl-onnx
 [release-bge-large-zh-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/bge-large-zh-onnx
 [release-tinyllama-1.1b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/tinyllama-1.1b-chat-onnx
+[release-yi-6b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/yi-6b-chat-onnx
 
 ## 用法
 1. 将该项目clone到本地
