@@ -363,14 +363,27 @@ class LLM(torch.nn.Module):
                         line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
                         fp.write(line)
         else:
-            # other
+            # huggingface tokenizer
+            def unicode_to_byte(u: int):
+                if u >= 256 and u <= 288:
+                    return u - 256
+                if u >= 289 and u <= 322:
+                    return u - 162
+                if u == 323:
+                    return 173
+                if u == 65372: # |
+                    return 124
+                if u == 9601:  # _
+                    return 95
+                return u
             with open(file_path, "w", encoding="utf8") as fp:
                 vocab = self.tokenizer.get_vocab()
                 vocab_list = ['<unk>' for i in range(len(vocab))]
                 for k, v in vocab.items():
-                    k = k.replace('Ċ', '\n')
-                    k = k.replace('Ġ', ' ')
-                    vocab_list[int(v)] = k
+                    try:
+                        vocab_list[int(v)] = bytes([unicode_to_byte(ord(c)) for c in k]).decode('utf-8', errors='ignore')
+                    except:
+                        vocab_list[int(v)] = k
                 for v in vocab_list:
                     line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
                     fp.write(line)
@@ -715,6 +728,8 @@ class Llama2_7b_Chat(LLM):
             self.model_name = 'TinyLlama'
         if 'Yi' in args.path:
             self.model_name = 'Yi'
+        if 'deepseek' in args.path:
+            self.model_name = 'deepseek'
         super().__init__(args)
 
     def load_model(self, model_path: str):
@@ -763,6 +778,8 @@ class Llama2_7b_Chat(LLM):
             return f'<s><|system|>\nYou are a friendly chatbot who always responds in the style of a pirate</s>\n<|user|>\n{query}</s>\n<|assistant|>\n'
         if 'Yi' in self.model_name:
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
+        if 'deepseek' in self.model_name:
+            return f'<|begin▁of▁sentence|>User: {query}\nAssistant:'
         return f'[INST]{query}[/INST]'
 
 
@@ -973,6 +990,7 @@ if __name__ == '__main__':
         'internlm-chat-7b': Llama2_7b_Chat,
         'TinyLlama-1_1B-Chat': Llama2_7b_Chat,
         'Yi-6B-Chat': Llama2_7b_Chat,
+        'deepseek-llm-7b-chat': Llama2_7b_Chat,
         'phi-2': phi_2,
         'bge-large-zh': bge
     }
