@@ -5,6 +5,7 @@ import shutil
 import argparse
 import torch
 import numpy as np
+from onnxslim import slim
 import onnxruntime as ort
 import _tools as MNNTools
 import sentencepiece as spm
@@ -83,7 +84,7 @@ class LLM(torch.nn.Module):
         self.export_verbose = args.export_verbose
         self.export_test = args.export_test
         self.embed_bf16 = args.embed_bf16
-        self.slim = args.slim
+        self.skip_slim = args.skip_slim
         tokenizer_model = os.path.join(args.path, 'tokenizer.model')
         if os.path.exists(tokenizer_model):
             self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
@@ -186,8 +187,7 @@ class LLM(torch.nn.Module):
                         output_names=['token_id'],
                         do_constant_folding=True,
                         opset_version=15)
-        if self.slim:
-            from onnxslim import slim
+        if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         # test lm
         if self.export_test:
@@ -217,8 +217,7 @@ class LLM(torch.nn.Module):
                         }},
                         do_constant_folding=True,
                         opset_version=15)
-        if self.slim:
-            from onnxslim import slim
+        if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         # test
         if self.export_test:
@@ -246,8 +245,7 @@ class LLM(torch.nn.Module):
                         }},
                         do_constant_folding=True,
                         opset_version=15)
-        if self.slim:
-            from onnxslim import slim
+        if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         # test
         if self.export_test:
@@ -281,8 +279,7 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.block_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        if self.slim:
-            from onnxslim import slim
+        if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         if self.export_test:
             original_outs = model(inputs_embeds, attention_mask, position_ids, past_key_values)
@@ -322,8 +319,7 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        if self.slim:
-            from onnxslim import slim
+        if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         if self.export_test:
             # test
@@ -961,8 +957,7 @@ class bge(LLM):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        if self.slim:
-            from onnxslim import slim
+        if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         if self.export_test:
             self.seq_len = 4
@@ -1042,7 +1037,7 @@ if __name__ == '__main__':
     parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
     parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
     parser.add_argument('--embed_bf16', action='store_true', help='using `bfloat16` replace `float32` in embedding.')
-    parser.add_argument('--slim', action='store_true', help='Whether or not to slim the exported onnx model.')
+    parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
 
 
     args = parser.parse_args()
