@@ -990,6 +990,28 @@ class bge(LLM):
     def get_attention_mask(self) -> torch.Tensor:
         return torch.ones([1, 1, 1, self.seq_len], dtype=torch.long)
 
+class LoraModule(torch.nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.onnx_path = args.onnx_path
+        self.mnn_path = args.mnn_path
+        self.export_mnn = args.export_mnn
+        import peft
+        lora_weight = peft.load_peft_weights(args.path)
+        for k, v in lora_weight.items():
+            k = k.replace('.', '/')
+            self.register_buffer(k, v.cpu())
+
+    def forward(self, dummpy):
+        return self._buffers
+
+    def export(self):
+        onnx_model = f'./{self.onnx_path}/lora.onnx'
+        torch.onnx.export(self.eval(), torch.tensor([]), onnx_model)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
+
+
 if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
@@ -1006,7 +1028,8 @@ if __name__ == '__main__':
         'Yi-6B-Chat': Llama2_7b_Chat,
         'deepseek-llm-7b-chat': Llama2_7b_Chat,
         'phi-2': phi_2,
-        'bge-large-zh': bge
+        'bge-large-zh': bge,
+        'lora': LoraModule
     }
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
