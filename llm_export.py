@@ -7,9 +7,12 @@ import torch
 import numpy as np
 from onnxslim import slim
 import onnxruntime as ort
-import _tools as MNNTools
 import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+try:
+    import _tools as MNNTools
+except:
+    MNNTools = None
 
 def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data = False, bizCode : str= None):
     model_name, model_extension = os.path.splitext(os.path.basename(onnx_path))
@@ -83,13 +86,25 @@ class LLM(torch.nn.Module):
         self.export_mnn = args.export_mnn
         self.export_verbose = args.export_verbose
         self.export_test = args.export_test
-        self.embed_bf16 = args.embed_bf16
+        # default is False, just set True when using below command:
+        # `python llm_export ../path --export --embed_bin` to export single model without embedding
+        self.without_embed = False
+        self.embed_bin = args.embed_bin
+        if self.embed_bin:
+            self.embed_bf16 = True
+        else:
+            self.embed_bf16 = args.embed_bf16
         self.skip_slim = args.skip_slim
         tokenizer_model = os.path.join(args.path, 'tokenizer.model')
         if os.path.exists(tokenizer_model):
             self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
         else:
             self.sp_model = None
+        merge_file = os.path.join(args.path, 'merges.txt')
+        if os.path.exists(merge_file):
+            self.merge_txt = merge_file
+        else:
+            self.merge_txt = None
         self.stop_ids = []
         self.max_length = 1024
         self.hidden_size = 4096
@@ -111,11 +126,14 @@ class LLM(torch.nn.Module):
     def visual_embed(self, input_ids):
         raise NotImplementedError
 
-    def forward(self, input_ids, attention_mask, position_ids, past_key_values):
-        if self.visual is not None and past_key_values[0] is None:
-            hidden_states = self.visual_embed(input_ids)
+    def __embedding(self, input_ids):
+        if self.visual is not None and self.token_len == 0:
+            input_embeds = self.visual_embed(input_ids)
         else:
-            hidden_states = self.embed(input_ids)
+            input_embeds = self.embed(input_ids)
+        return input_embeds
+
+    def __decode(self, hidden_states, attention_mask, position_ids, past_key_values):
         presents = []
         for i in range(self.block_nums):
             hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])
@@ -125,6 +143,11 @@ class LLM(torch.nn.Module):
         self.seq_len += 1
         self.token_len += 1
         return token_id, presents
+
+    def forward(self, input_ids, attention_mask, position_ids, past_key_values):
+        if self.without_embed:
+            return self.__decode(input_ids, attention_mask, position_ids, past_key_values)
+        return self.__decode(self.__embedding(input_ids), attention_mask, position_ids, past_key_values)
 
     # some test functions
     def build_prompt(self, query):
@@ -233,6 +256,14 @@ class LLM(torch.nn.Module):
 
     def export_embed(self):
         model = self.embed
+        if self.embed_bin:
+            import ctypes
+            tensor_data = model.embed.weight.data
+            data_ptr = tensor_data.untyped_storage().data_ptr()
+            buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
+            with open(f'./{self.mnn_path}/embeddings_bf16.bin', 'wb') as f:
+                f.write(buffer)
+            return
         input_ids = torch.arange(3, dtype=torch.long)
         onnx_model = f'./{self.onnx_path}/embedding.onnx'
         torch.onnx.export(model, (input_ids),
@@ -308,6 +339,10 @@ class LLM(torch.nn.Module):
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape)
         onnx_model = f'./{self.onnx_path}/llm.onnx'
+        if self.embed_bin:
+            self.without_embed = True
+            input_ids = self.__embedding(input_ids)
+        print('export start ...')
         torch.onnx.export(
             model, (input_ids, attention_mask, position_ids, past_key_values),
             onnx_model,
@@ -319,6 +354,7 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
+        print('export done!')
         if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
         if self.export_test:
@@ -336,11 +372,14 @@ class LLM(torch.nn.Module):
         if self.export_mnn:
             # single model is > 2G, using external_data
             onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric, True)
+        if self.without_embed:
+            self.without_embed = False
 
     def export_tokenizer(self):
         file_path = os.path.join(self.onnx_path, "tokenizer.txt")
         if self.sp_model is not None:
             # senetencepiece
+            print('# senetencepiece tokenier')
             NORMAL = 1; UNKNOWN = 2; CONTROL = 3
             USER_DEFINED = 4; UNUSED = 5; BYTE = 6
             fp = open(file_path, "w", encoding="utf8")
@@ -365,6 +404,7 @@ class LLM(torch.nn.Module):
                 fp.write(f'{token_encode} {score} {type}\n')
             fp.close()
         elif hasattr(self.tokenizer, 'mergeable_ranks'):
+            print('# tiktoken tokenier')
             # tikton
             with open(file_path, "w", encoding="utf8") as fp:
                 for k, v in self.tokenizer.mergeable_ranks.items():
@@ -374,6 +414,25 @@ class LLM(torch.nn.Module):
                     for k, v in self.tokenizer.special_tokens.items():
                         line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
                         fp.write(line)
+        elif self.merge_txt is not None:
+            # huggingface tokenizer
+            merge_list = []
+            vocab = self.tokenizer.get_vocab()
+            vocab_list = ['<unk>' for i in range(len(vocab))]
+            # load vocab
+            for k, v in vocab.items():
+                vocab_list[int(v)] = k
+            # load merge
+            with open(self.merge_txt, 'rt') as merge:
+                for line in merge.readlines():
+                    merge_list.append(line)
+            # write to tokenizer.txt
+            with open(file_path, "w", encoding="utf8") as fp:
+                fp.write(f'{len(vocab_list)} {len(merge_list)}\n')
+                for v in vocab_list:
+                    fp.write(v + '\n')
+                for m in merge_list:
+                    fp.write(m)
         else:
             # huggingface tokenizer
             def unicode_to_byte(u: int):
@@ -688,6 +747,107 @@ class Qwen_Chat(LLM):
         if self.token_len:
             return torch.tensor([self.seq_len - 1], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
+
+    def visual_embed(self, input_ids):
+        if not torch.any(input_ids == self.image_start_id):
+            return self.embed(input_ids)
+        bos_pos = torch.where(input_ids == self.image_start_id)
+        eos_pos = torch.where(input_ids == self.image_start_id + 1)
+        img_pos = torch.stack((bos_pos[0], bos_pos[1], eos_pos[1]), dim=1)
+        images = []
+        for i, a, b in img_pos:
+            image = input_ids[i][a + 1 : b - 1].tolist()
+            image = image[ : image.index(self.image_start_id + 2)]
+            images.append(bytes(image).decode('utf-8'))
+        images = self.visual.encode(images)
+        hidden_states = self.embed(input_ids).view(1, -1, self.hidden_size)
+        for idx, (i, a, b) in enumerate(img_pos):
+            hidden_states[i][a + 1 : b] = images[idx]
+        return hidden_states.view(-1, 1, self.hidden_size)
+
+class QWEN2Block(torch.nn.Module):
+    def __init__(self, name, block, block_id, hidden_size, final_layernorm = None):
+        super().__init__()
+        self.name = name
+        self.block = block
+        self.block_id = block_id
+        self.final_layernorm = final_layernorm
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        theta = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
+        position_ids = position_ids.float().reshape(-1, 1)
+        idx_theta = position_ids * theta
+        rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
+        rotary_pos_emb = rotary_pos_emb.unsqueeze(0).unsqueeze(0)
+        rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
+        hidden_states, presents = self.block(hidden_states=hidden_states,
+                                             attention_mask=attention_mask,
+                                             past_key_value=past_kv,
+                                             rotary_pos_emb=rotary_pos_emb,
+                                             use_cache=True)
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
+        if isinstance(presents, tuple):
+            presents = torch.stack(presents)
+        return hidden_states, presents
+
+class Qwen2_Chat(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        # Qwen2 models
+        self.model_name = 'Qwen2-7B'
+        transformer = model.model
+        self.lm_ = model.lm_head
+        self.embed_ = transformer.embed_tokens
+        self.blocks_ = transformer.layers
+        self.final_layernorm_ = transformer.norm
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        if hasattr(model, 'generation_config'):
+            self.stop_ids.append(self.stop_id)
+            for id in model.generation_config.eos_token_id:
+                self.stop_ids.append(id)
+        self.block_nums = len(self.blocks_)
+        self.hidden_size = self.embed_.weight.shape[-1]
+        self.embed = Embedding(self.embed_, self.embed_bf16)
+        self.lm = Lm(self.lm_)
+        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        # 4b
+        self.past_kv_shape = [self.block_nums, 2, 1, 20, 0, 128]
+        # some config for export
+        self.block_dynamic_axes = {
+            "inputs_embeds" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 2: "history_len" }
+        }
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 3: "history_len" }
+        }
+
+    def build_prompt(self, query):
+        return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+        return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
+
+
+    def get_position_ids(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
     def visual_embed(self, input_ids):
         if not torch.any(input_ids == self.image_start_id):
@@ -1021,6 +1181,7 @@ if __name__ == '__main__':
         'Qwen-7B-Chat': Qwen_Chat,
         'Qwen-1_8B-Chat': Qwen_Chat,
         'Qwen-VL-Chat': Qwen_Chat,
+        'Qwen1_5-4B-Chat': Qwen2_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat,
@@ -1059,6 +1220,7 @@ if __name__ == '__main__':
     parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
     parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
     parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
+    parser.add_argument('--embed_bin', action='store_true', help='export embedding weight as bin file with dtype `bfloat16`')
     parser.add_argument('--embed_bf16', action='store_true', help='using `bfloat16` replace `float32` in embedding.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
 
