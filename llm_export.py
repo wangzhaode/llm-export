@@ -766,16 +766,17 @@ class Qwen_Chat(LLM):
         return hidden_states.view(-1, 1, self.hidden_size)
 
 class QWEN2Block(torch.nn.Module):
-    def __init__(self, name, block, block_id, hidden_size, final_layernorm = None):
+    def __init__(self, name, block, block_id, hidden_size, head_dim, final_layernorm = None):
         super().__init__()
         self.name = name
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
         self.hidden_size = hidden_size
+        self.head_dim = head_dim
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
-        theta = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
+        theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
@@ -792,6 +793,7 @@ class QWEN2Block(torch.nn.Module):
             hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
+        # print('###', presents.shape)
         return hidden_states, presents
 
 class Qwen2_Chat(LLM):
@@ -801,8 +803,9 @@ class Qwen2_Chat(LLM):
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        self.config = model.config
         # Qwen2 models
-        self.model_name = 'Qwen2-7B'
+        self.model_name = 'Qwen2'
         transformer = model.model
         self.lm_ = model.lm_head
         self.embed_ = transformer.embed_tokens
@@ -814,13 +817,14 @@ class Qwen2_Chat(LLM):
             self.stop_ids.append(self.stop_id)
             for id in model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
-        self.block_nums = len(self.blocks_)
-        self.hidden_size = self.embed_.weight.shape[-1]
+        self.block_nums = self.config.num_hidden_layers
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
-        # 4b
-        self.past_kv_shape = [self.block_nums, 2, 1, 20, 0, 128]
+        self.past_kv_shape = [self.block_nums, 2, 1, self.num_heads, 0, self.head_dim]
+        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.hidden_size, self.head_dim, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
@@ -1181,7 +1185,10 @@ if __name__ == '__main__':
         'Qwen-7B-Chat': Qwen_Chat,
         'Qwen-1_8B-Chat': Qwen_Chat,
         'Qwen-VL-Chat': Qwen_Chat,
+        'Qwen1_5-0_5B-Chat': Qwen2_Chat,
+        'Qwen1_5-1_8B-Chat': Qwen2_Chat,
         'Qwen1_5-4B-Chat': Qwen2_Chat,
+        'Qwen1_5-7B-Chat': Qwen2_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat,

@@ -26,6 +26,9 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 - [![Download][download-tinyllama-1.1b-chat-onnx]][release-tinyllama-1.1b-chat-onnx]
 - [![Download][download-yi-6b-chat-onnx]][release-yi-6b-chat-onnx]
 - [![Download][download-deepseek-7b-chat-onnx]][release-deepseek-7b-chat-onnx]
+- [![Download][download-qwen1.5-0.5b-chat-onnx]][release-qwen1.5-0.5b-chat-onnx]
+- [![Download][download-qwen1.5-1.8b-chat-onnx]][release-qwen1.5-1.8b-chat-onnx]
+- [![Download][download-qwen1.5-4b-chat-onnx]][release-qwen1.5-4b-chat-onnx]
 
 [download-chatglm-6b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/chatglm-6b-onnx/total
 [download-chatglm2-6b-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/chatglm2-6b-onnx/total
@@ -42,6 +45,9 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 [download-tinyllama-1.1b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/tinyllama-1.1b-chat-onnx/total
 [download-yi-6b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/yi-6b-chat-onnx/total
 [download-deepseek-7b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/deepseek-7b-chat-onnx/total
+[download-qwen1.5-0.5b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/qwen1.5-0.5b-chat-onnx/total
+[download-qwen1.5-1.8b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/qwen1.5-1.8b-chat-onnx/total
+[download-qwen1.5-4b-chat-onnx]: https://img.shields.io/github/downloads/wangzhaode/llm-export/qwen1.5-4b-chat-onnx/total
 [release-chatglm-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm-6b-onnx
 [release-chatglm2-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm2-6b-onnx
 [release-chatglm3-6b-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/chatglm3-6b-onnx
@@ -57,6 +63,9 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 [release-tinyllama-1.1b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/tinyllama-1.1b-chat-onnx
 [release-yi-6b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/yi-6b-chat-onnx
 [release-deepseek-7b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/deepseek-7b-chat-onnx
+[release-qwen1.5-0.5b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/qwen1.5-0.5b-chat-onnx
+[release-qwen1.5-1.8b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/qwen1.5-1.8b-chat-onnx
+[release-qwen1.5-4b-chat-onnx]: https://github.com/wangzhaode/llm-export/releases/tag/qwen1.5-4b-chat-onnx
 
 ## 用法
 1. 将该项目clone到本地
@@ -134,6 +143,7 @@ optional arguments:
   --export_block EXPORT_BLOCK
                         export llm block [id] to an `onnx` model.
   --export_blocks       export llm all blocks to `onnx` models.
+  --embed_bin           export embedding weight as bin file with dtype `bfloat16`
   --embed_bf16          using `bfloat16` replace `float32` in embedding.
   --skip_slim           Whether or not to skip onnx-slim.
 ```
