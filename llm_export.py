@@ -1184,6 +1184,7 @@ if __name__ == '__main__':
         'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_Chat,
         'Qwen-1_8B-Chat': Qwen_Chat,
+        'Qwen-1_8B': Qwen_Chat,
         'Qwen-VL-Chat': Qwen_Chat,
         'Qwen1_5-0_5B-Chat': Qwen2_Chat,
         'Qwen1_5-1_8B-Chat': Qwen2_Chat,
