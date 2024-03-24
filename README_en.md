@@ -6,7 +6,8 @@ llm-export is a tool for exporting llm models, capable of converting llm models 
 - 🚀 All passed `onnxruntime` correctness tests
 - 🚀 Optimized the original code to support dynamic shapes
 - 🚀 Optimized the original code to reduce the constant portion
-
+- 🚀 Using [OnnxSlim](https://github.com/WeLoveAI/OnnxSlim) slim onnx model，speed up 5%; by [@inisis](https://github.com/inisis)
+- 🚀 Support export lora weight to onnx or MNN model
 
 ## Model Support and Downloads
 
@@ -47,12 +48,14 @@ python llm_export.py \
 - Supports exporting the tokenizer as a text file, use --export_token
 - Supports converting the exported ONNX model to an MNN model, with default conversion to non-symmetric 4bit quantization, use --export_mnn
 - Specify export paths using --onnx_path and --mnn_path
+- Default using onnx-slim, skip using --skip_slim
 
 ## Commad Args
 ```
-usage: llm_export.py [-h] --path PATH [--type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b}] [--onnx_path ONNX_PATH]
-                     [--mnn_path MNN_PATH] [--export_mnn] [--export_verbose] [--export_test] [--test TEST] [--export] [--export_split] [--export_token] [--export_embed] [--export_visual] [--export_lm]
-                     [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bf16]
+usage: llm_export.py [-h] --path PATH
+                     [--type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b,TinyLlama-1_1B-Chat,Yi-6B-Chat,deepseek-llm-7b-chat,phi-2,bge-large-zh}]
+                     [--onnx_path ONNX_PATH] [--mnn_path MNN_PATH] [--export_mnn] [--export_verbose] [--export_test] [--test TEST] [--export] [--export_split] [--export_token] [--export_embed] [--export_visual] [--export_lm]
+                     [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bf16] [--skip_slim]
 
 llm_exporter
 
@@ -62,7 +65,7 @@ optional arguments:
                         Can be either:
                                 - A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
                                 - A path to a *directory* clone from repo like `../chatglm-6b`.
-  --type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b}
+  --type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b,TinyLlama-1_1B-Chat,Yi-6B-Chat,deepseek-llm-7b-chat,phi-2,bge-large-zh}
                         type(`str`, *optional*):
                                 The pretrain llm model type.
   --onnx_path ONNX_PATH
@@ -85,4 +88,5 @@ optional arguments:
                         export llm block [id] to an `onnx` model.
   --export_blocks       export llm all blocks to `onnx` models.
   --embed_bf16          using `bfloat16` replace `float32` in embedding.
+  --skip_slim           Whether or not to skip onnx-slim.
 ```
