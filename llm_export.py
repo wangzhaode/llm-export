@@ -906,11 +906,14 @@ class Llama2_7b_Chat(LLM):
             self.model_name = 'Yi'
         if 'deepseek' in args.path:
             self.model_name = 'deepseek'
+        if 'Llama-3' in args.path:
+            self.model_name = 'Llama3_8B'
         super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        self.config = model.config
         transformer = model.model
         self.lm_ = model.lm_head
         self.embed_ = transformer.embed_tokens
@@ -922,16 +925,18 @@ class Llama2_7b_Chat(LLM):
         if hasattr(model, 'generation_config'):
             self.stop_ids.append(self.stop_id)
             self.stop_ids.append(model.generation_config.eos_token_id)
+        if self.model_name == 'Llama3_8B':
+            self.stop_ids.append(self.tokenizer.convert_tokens_to_ids("<|eot_id|>"))
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
         self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
-        # some config for export
-        self.past_kv_shape = [32, 2, 1, 32, 0, 128]
-        if 'Yi' in self.model_name:
-            self.past_kv_shape = [32, 2, 1, 4, 0, 128]
-        if self.block_nums == 22:
-            self.past_kv_shape = [22, 2, 1, 4, 0, 64]
+        self.block_nums = self.config.num_hidden_layers
+        self.hidden_size = self.config.hidden_size
+        self.num_attention_heads = self.config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.num_key_value_heads = self.config.num_key_value_heads
+        self.past_kv_shape = [self.block_nums, 2, 1, self.num_key_value_heads, 0, self.head_dim]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
@@ -956,8 +961,9 @@ class Llama2_7b_Chat(LLM):
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
         if 'deepseek' in self.model_name:
             return f'<|begin▁of▁sentence|>User: {query}\nAssistant:'
+        if 'Llama3' in self.model_name:
+            return f'<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
         return f'[INST]{query}[/INST]'
-
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -1192,6 +1198,7 @@ if __name__ == '__main__':
         'Qwen1_5-7B-Chat': Qwen2_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
+        'Llama-3-8B-Instruct': Llama2_7b_Chat,
         'internlm-chat-7b': Llama2_7b_Chat,
         'TinyLlama-1_1B-Chat': Llama2_7b_Chat,
         'Yi-6B-Chat': Llama2_7b_Chat,
