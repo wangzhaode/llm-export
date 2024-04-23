@@ -111,13 +111,15 @@ python llm_export.py \
 - 支持将导出的onnx模型转换为mnn模型，默认转换为非对称4bit量化，使用`--export_mnn`
 - 指定导出路径使用`--onnx_path`和`--mnn_path`
 - 默认会使用onnx-slim对onnx模型进行优化，跳过该步骤使用`--skip_slim`
+- 支持合并lora权重后导出，指定lora权重的目录使用`--lora_path`
 
 ## 参数
 ```
 usage: llm_export.py [-h] --path PATH
-                     [--type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b,TinyLlama-1_1B-Chat,Yi-6B-Chat,deepseek-llm-7b-chat,phi-2,bge-large-zh}]
-                     [--onnx_path ONNX_PATH] [--mnn_path MNN_PATH] [--export_mnn] [--export_verbose] [--export_test] [--test TEST] [--export] [--export_split] [--export_token] [--export_embed] [--export_visual] [--export_lm]
-                     [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bf16] [--skip_slim]
+                     [--type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-1_8B,Qwen-VL-Chat,Qwen1_5-0_5B-Chat,Qwen1_5-1_8B-Chat,Qwen1_5-4B-Chat,Qwen1_5-7B-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,Llama-3-8B-Instruct,internlm-chat-7b,TinyLlama-1_1B-Chat,Yi-6B-Chat,deepseek-llm-7b-chat,phi-2,bge-large-zh,lora}]
+                     [--lora_path LORA_PATH] [--onnx_path ONNX_PATH] [--mnn_path MNN_PATH] [--export_mnn] [--export_verbose] [--export_test] [--test TEST] [--export]
+                     [--export_split] [--export_token] [--export_embed] [--export_visual] [--export_lm] [--export_block EXPORT_BLOCK] [--export_blocks] [--embed_bin]
+                     [--embed_bf16] [--skip_slim]
 
 llm_exporter
 
@@ -125,11 +127,13 @@ optional arguments:
   -h, --help            show this help message and exit
   --path PATH           path(`str` or `os.PathLike`):
                         Can be either:
-                                - A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
-                                - A path to a *directory* clone from repo like `../chatglm-6b`.
-  --type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-VL-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,internlm-chat-7b,TinyLlama-1_1B-Chat,Yi-6B-Chat,deepseek-llm-7b-chat,phi-2,bge-large-zh}
+                        	- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
+                        	- A path to a *directory* clone from repo like `../chatglm-6b`.
+  --type {chatglm-6b,chatglm2-6b,chatglm3-6b,codegeex2-6b,Qwen-7B-Chat,Qwen-1_8B-Chat,Qwen-1_8B,Qwen-VL-Chat,Qwen1_5-0_5B-Chat,Qwen1_5-1_8B-Chat,Qwen1_5-4B-Chat,Qwen1_5-7B-Chat,Baichuan2-7B-Chat,Llama-2-7b-chat-ms,Llama-3-8B-Instruct,internlm-chat-7b,TinyLlama-1_1B-Chat,Yi-6B-Chat,deepseek-llm-7b-chat,phi-2,bge-large-zh,lora}
                         type(`str`, *optional*):
-                                The pretrain llm model type.
+                        	The pretrain llm model type.
+  --lora_path LORA_PATH
+                        lora path, defaut is `None` mean not apply lora.
   --onnx_path ONNX_PATH
                         export onnx model path, defaut is `./onnx`.
   --mnn_path MNN_PATH   export mnn model path, defaut is `./mnn`.
@@ -139,9 +143,9 @@ optional arguments:
   --test TEST           test model inference with query `TEST`.
   --export              export model to an `onnx` model.
   --export_split        export model split to some `onnx` models:
-                                - embedding model.
-                                - block models.
-                                - lm_head model.
+                        	- embedding model.
+                        	- block models.
+                        	- lm_head model.
   --export_token        export llm tokenizer to a txt file.
   --export_embed        export llm embedding to an `onnx` model.
   --export_visual       export llm visual model to an `onnx` model.
