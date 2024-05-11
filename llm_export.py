@@ -189,7 +189,7 @@ class LLM(torch.nn.Module):
             attention_mask = self.get_attention_mask()
             position_ids = self.get_position_ids()
             token_id, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
-            if token_id == self.stop_id or token_id in self.stop_ids:
+            if token_id in self.stop_ids:
                 print("", end='\n')
                 break
             word = self.id_to_str(token_id)
@@ -387,13 +387,34 @@ class LLM(torch.nn.Module):
             self.without_embed = False
 
     def export_tokenizer(self):
-        file_path = os.path.join(self.onnx_path, "tokenizer.txt")
+        # TOKENIZER MAGIC NUMBER
+        MAGIC_NUMBER = 430
+        # TOKENIZER TYPE
+        SENTENCEPIECE = 0; TIKTOIKEN = 1; BERT = 2; HUGGINGFACE = 3
+        def write_line(fp, *args):
+            for arg in args:
+                for token in arg:
+                    fp.write(str(token) + ' ')
+            fp.write('\n')
+        def write_header(fp, type, speicals, prefix = []):
+            fp.write(f'{MAGIC_NUMBER} {type}\n')
+            fp.write(f'{len(speicals)} {len(self.stop_ids)} {len(prefix)}\n')
+            write_line(fp, speicals, self.stop_ids, prefix)
+
+        file_path = os.path.join(self.mnn_path, "tokenizer.txt")
+        special_list = list(self.tokenizer.added_tokens_decoder.keys())
+        if hasattr(self.tokenizer, 'special_tokens'):
+            for k, v in self.tokenizer.special_tokens.items():
+                special_list.append(v)
+        vocab_list = []
+        prefix_list = []
+        if hasattr(self.tokenizer, 'get_prefix_tokens'):
+            prefix_list = self.tokenizer.get_prefix_tokens()
         if self.sp_model is not None:
             # senetencepiece
             print('# senetencepiece tokenier')
             NORMAL = 1; UNKNOWN = 2; CONTROL = 3
             USER_DEFINED = 4; UNUSED = 5; BYTE = 6
-            fp = open(file_path, "w", encoding="utf8")
             for i in range(self.sp_model.GetPieceSize()):
                 token = self.sp_model.IdToPiece(i)
                 score = self.sp_model.GetScore(i)
@@ -412,23 +433,35 @@ class LLM(torch.nn.Module):
                     if '<|blank_' in token: token = ' ' * int(token[8:token.find('|>')])
                 if '▁' in token: token = token.replace('▁', ' ')
                 token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
-                fp.write(f'{token_encode} {score} {type}\n')
-            fp.close()
+                vocab_list.append(f'{token_encode} {score} {type}\n')
+            with open(file_path, "w", encoding="utf8") as fp:
+                write_header(fp, SENTENCEPIECE, special_list, prefix_list)
+                fp.write(f'{len(vocab_list)}\n')
+                for vocab in vocab_list:
+                    fp.write(vocab)
         elif hasattr(self.tokenizer, 'mergeable_ranks'):
             print('# tiktoken tokenier')
             # tikton
+            vocab_list = []
+            special_list = []
+            for k, v in self.tokenizer.mergeable_ranks.items():
+                line = base64.b64encode(k).decode("utf8") + "\n"
+                vocab_list.append(line)
+            if hasattr(self.tokenizer, 'special_tokens'):
+                for k, v in self.tokenizer.special_tokens.items():
+                    special_list.append(v)
+                    line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
+                    vocab_list.append(line)
             with open(file_path, "w", encoding="utf8") as fp:
-                for k, v in self.tokenizer.mergeable_ranks.items():
-                    line = base64.b64encode(k).decode("utf8") + "\n"
-                    fp.write(line)
-                if hasattr(self.tokenizer, 'special_tokens'):
-                    for k, v in self.tokenizer.special_tokens.items():
-                        line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
-                        fp.write(line)
+                write_header(fp, TIKTOIKEN, special_list)
+                fp.write(f'{len(vocab_list)}\n')
+                for vocab in vocab_list:
+                    fp.write(vocab)
         elif self.merge_txt is not None:
             # huggingface tokenizer
             merge_list = []
             vocab = self.tokenizer.get_vocab()
+            special_list = list(self.tokenizer.added_tokens_decoder.keys())
             vocab_list = ['<unk>' for i in range(len(vocab))]
             # load vocab
             for k, v in vocab.items():
@@ -439,13 +472,15 @@ class LLM(torch.nn.Module):
                     merge_list.append(line)
             # write to tokenizer.txt
             with open(file_path, "w", encoding="utf8") as fp:
+                write_header(fp, HUGGINGFACE, special_list)
                 fp.write(f'{len(vocab_list)} {len(merge_list)}\n')
                 for v in vocab_list:
                     fp.write(v + '\n')
                 for m in merge_list:
                     fp.write(m)
         else:
-            # huggingface tokenizer
+            print('# other tiktoken tokenier')
+            # other tikton
             def unicode_to_byte(u: int):
                 if u >= 256 and u <= 288:
                     return u - 256
@@ -458,18 +493,20 @@ class LLM(torch.nn.Module):
                 if u == 9601:  # _
                     return 95
                 return u
+            vocab = self.tokenizer.get_vocab()
+            vocab_list = ['<unk>' for i in range(len(vocab))]
+            for k, v in vocab.items():
+                try:
+                    vocab_list[int(v)] = bytes([unicode_to_byte(ord(c)) for c in k]).decode('utf-8', errors='ignore')
+                except:
+                    vocab_list[int(v)] = k
+            special_list = list(self.tokenizer.added_tokens_decoder.keys())
             with open(file_path, "w", encoding="utf8") as fp:
-                vocab = self.tokenizer.get_vocab()
-                vocab_list = ['<unk>' for i in range(len(vocab))]
-                for k, v in vocab.items():
-                    try:
-                        vocab_list[int(v)] = bytes([unicode_to_byte(ord(c)) for c in k]).decode('utf-8', errors='ignore')
-                    except:
-                        vocab_list[int(v)] = k
+                write_header(fp, TIKTOIKEN, special_list)
+                fp.write(f'{len(vocab_list)}\n')
                 for v in vocab_list:
                     line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
                     fp.write(line)
-
 
 # chatglm
 class GLMBlock(torch.nn.Module):
@@ -505,7 +542,7 @@ class Chatglm_6b(LLM):
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.final_layernorm
         # some wrapper
-        self.stop_id = self.tokenizer._convert_token_to_id(self.tokenizer.eos_token)
+        self.stop_ids.append(self.tokenizer._convert_token_to_id(self.tokenizer.eos_token))
         self.block_nums = len(self.blocks_)
         self.lm = Lm(self.lm_)
         # chatglm embedding and lm using same param, copy embedding when using bf16
@@ -588,10 +625,10 @@ class Chatglm2_6b(LLM):
         self.blocks_ = transformer.encoder.layers
         self.final_layernorm_ = transformer.encoder.final_layernorm
         # some wrapper
-        self.stop_id = self.tokenizer.eos_token_id
-        if self.stop_id is None:
+        self.stop_ids.append(self.tokenizer.eos_token_id)
+        if len(self.stop_ids) == 0:
             # codegeex2-6b
-            self.stop_id = self.tokenizer.tokenizer.eos_id
+            self.stop_ids.append(self.tokenizer.tokenizer.eos_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
@@ -710,7 +747,7 @@ class Qwen_Chat(LLM):
             self.image_start_id = transformer.config.visual['image_start_id']
             self.image_size = transformer.config.visual['image_size']
         # some wrapper
-        self.stop_id = self.tokenizer.im_end_id
+        self.stop_ids.append(self.tokenizer.im_end_id)
         self.block_nums = len(self.blocks_)
         self.hidden_size = transformer.embed_dim
         self.embed = Embedding(self.embed_, self.embed_bf16)
@@ -815,9 +852,8 @@ class Qwen2_Chat(LLM):
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.norm
         # some wrapper
-        self.stop_id = self.tokenizer.eos_token_id
+        self.stop_ids.append(self.tokenizer.eos_token_id)
         if hasattr(self.model, 'generation_config'):
-            self.stop_ids.append(self.stop_id)
             for id in self.model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
         self.block_nums = self.config.num_hidden_layers
@@ -890,6 +926,7 @@ class LLAMA2Block(torch.nn.Module):
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
+        position_ids = position_ids.view(1, -1)
         hidden_states, presents = self.block(hidden_states,
                                              attention_mask,
                                              position_ids,
@@ -928,9 +965,8 @@ class Llama2_7b_Chat(LLM):
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.hidden_size = self.embed_.weight.shape[-1]
-        self.stop_id = self.tokenizer.eos_token_id
+        self.stop_ids.append(self.tokenizer.eos_token_id)
         if hasattr(self.model, 'generation_config'):
-            self.stop_ids.append(self.stop_id)
             self.stop_ids.append(self.model.generation_config.eos_token_id)
         if self.model_name == 'Llama3_8B':
             self.stop_ids.append(self.tokenizer.convert_tokens_to_ids("<|eot_id|>"))
@@ -1019,7 +1055,7 @@ class phi_2(LLM):
         self.blocks_ = transformer.h
         # self.final_layernorm_ = transformer.final_layernorm
         # some wrapper
-        self.stop_id = self.tokenizer.eos_token_id
+        self.stop_ids.append(self.tokenizer.eos_token_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
@@ -1098,7 +1134,7 @@ class bge(LLM):
         self.hidden_size = self.embed_.word_embeddings.weight.shape[-1]
         self.blocks_ = transformer.layer
         # some wrapper
-        self.stop_id = self.tokenizer.eos_token_id
+        self.stop_ids.append(self.tokenizer.eos_token_id)
         self.block_nums = len(self.blocks_)
         self.embed = self.embed_
         self.lm = self.lm_
