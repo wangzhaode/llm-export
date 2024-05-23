@@ -771,17 +771,18 @@ class Qwen_Chat(LLM):
         return hidden_states.view(-1, 1, self.hidden_size)
 
 class QWEN2Block(torch.nn.Module):
-    def __init__(self, name, block, block_id, hidden_size, head_dim, final_layernorm = None):
+    def __init__(self, name, block, block_id, config, final_layernorm = None):
         super().__init__()
         self.name = name
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
-        self.hidden_size = hidden_size
-        self.head_dim = head_dim
+        self.hidden_size = config.hidden_size
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.rope_theta = config.rope_theta
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
-        theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        theta = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
@@ -822,11 +823,12 @@ class Qwen2_Chat(LLM):
         self.block_nums = self.config.num_hidden_layers
         self.hidden_size = self.config.hidden_size
         self.num_heads = self.config.num_attention_heads
+        self.rope_theta = self.config.rope_theta
         self.head_dim = self.hidden_size // self.num_heads
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
         self.past_kv_shape = [self.block_nums, 2, 1, self.num_heads, 0, self.head_dim]
-        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.hidden_size, self.head_dim, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.config, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
