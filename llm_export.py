@@ -786,7 +786,7 @@ class QWEN2Block(torch.nn.Module):
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
-        rotary_pos_emb = rotary_pos_emb.unsqueeze(0).unsqueeze(0)
+        rotary_pos_emb = rotary_pos_emb.unsqueeze(1).unsqueeze(0)
         rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
         hidden_states, presents = self.block(hidden_states=hidden_states,
@@ -825,22 +825,27 @@ class Qwen2_Chat(LLM):
         self.num_heads = self.config.num_attention_heads
         self.rope_theta = self.config.rope_theta
         self.head_dim = self.hidden_size // self.num_heads
-        self.embed = Embedding(self.embed_, self.embed_bf16)
+        if self.embed_.weight is self.lm_.weight:
+            import copy
+            embed_copy = copy.deepcopy(self.embed_)
+            self.embed = Embedding(embed_copy, self.embed_bf16)
+        else:
+            self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.past_kv_shape = [self.block_nums, 2, 1, self.num_heads, 0, self.head_dim]
+        self.past_kv_shape = [self.block_nums, 2, 1, 0, self.num_heads, self.head_dim]
         self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.config, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 0: "seq_len" },
-            "past_key_values" : { 2: "history_len" }
+            "past_key_values" : { 1: "history_len" }
         }
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 0: "seq_len" },
-            "past_key_values" : { 3: "history_len" }
+            "past_key_values" : { 2: "history_len" }
         }
 
     def build_prompt(self, query):
