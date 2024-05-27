@@ -816,7 +816,7 @@ class Qwen2_Chat(LLM):
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.stop_id = self.tokenizer.eos_token_id
-        if hasattr(model, 'generation_config'):
+        if hasattr(self.model, 'generation_config'):
             self.stop_ids.append(self.stop_id)
             for id in self.model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
@@ -929,7 +929,7 @@ class Llama2_7b_Chat(LLM):
         # some wrapper
         self.hidden_size = self.embed_.weight.shape[-1]
         self.stop_id = self.tokenizer.eos_token_id
-        if hasattr(model, 'generation_config'):
+        if hasattr(self.model, 'generation_config'):
             self.stop_ids.append(self.stop_id)
             self.stop_ids.append(self.model.generation_config.eos_token_id)
         if self.model_name == 'Llama3_8B':
