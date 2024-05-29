@@ -213,6 +213,7 @@ class Attention(nn.Module):
 
         proj = self.W_pack(hidden_states)
         proj = proj.reshape([1, -1, 3, 4096]).permute([2, 0, 1, 3])
+        '''
         # proj = proj.unflatten(-1, (3, self.hidden_size)).unsqueeze(0).transpose(0, -2).squeeze(-2)
         query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -243,13 +244,35 @@ class Attention(nn.Module):
                 query_states, key_states, value_states, attn_bias=xops.LowerTriangularMask()
             )
         else:
-            '''
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-                attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = attention_mask)
-            '''
             attn_output = self.raw_atten(query_states, key_states, value_states, attention_mask)
             attn_output = attn_output.transpose(1, 2)
-
+        '''
+        #---------------
+        query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim)
+        value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim)
+        kv_seq_len = key_states.shape[1]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[1]
+        # rope
+        cos, sin = rotary_pos_emb
+        query_states = (query_states * cos) + (rotate_half(query_states) * sin)
+        key_states = (key_states * cos) + (rotate_half(key_states) * sin)
+        # kv cache
+        if past_key_value is not None:
+            past_key, past_value = past_key_value[0], past_key_value[1]
+            key_states = torch.cat((past_key, key_states), dim=1)
+            value_states = torch.cat((past_value, value_states), dim=1)
+        past_key_value = torch.stack((key_states, value_states))
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.permute([0, 2, 3, 1])
+        value_states = value_states.transpose(1, 2)
+        attn_weights = torch.matmul(query_states, key_states) / math.sqrt(self.head_dim)
+        attn_weights = attn_weights + attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        #---------------
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 

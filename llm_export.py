@@ -97,8 +97,11 @@ class LLM(torch.nn.Module):
             self.embed_bf16 = args.embed_bf16
         self.skip_slim = args.skip_slim
         tokenizer_model = os.path.join(args.path, 'tokenizer.model')
+        ice_text_model = os.path.join(args.path, 'ice_text.model')
         if os.path.exists(tokenizer_model):
             self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
+        elif os.path.exists(ice_text_model):
+            self.sp_model = spm.SentencePieceProcessor(ice_text_model)
         else:
             self.sp_model = None
         merge_file = os.path.join(args.path, 'merges.txt')
@@ -276,7 +279,7 @@ class LLM(torch.nn.Module):
             tensor_data = model.embed.weight.data
             data_ptr = tensor_data.untyped_storage().data_ptr()
             buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
-            with open(f'./{self.mnn_path}/embeddings_bf16.bin', 'wb') as f:
+            with open(f'./{self.onnx_path}/embeddings_bf16.bin', 'wb') as f:
                 f.write(buffer)
             return
         input_ids = torch.arange(3, dtype=torch.long)
@@ -375,13 +378,11 @@ class LLM(torch.nn.Module):
             for file_path in glob.glob(f'./{self.onnx_path}/onnx__*'):
                 try:
                     os.remove(file_path)
-                    print(f"The file {file_path} has been deleted.")
                 except FileNotFoundError:
                     pass
             for file_path in glob.glob(f'./{self.onnx_path}/model.*'):
                 try:
                     os.remove(file_path)
-                    print(f"The file {file_path} has been deleted.")
                 except FileNotFoundError:
                     pass
         if self.export_test:
@@ -417,11 +418,13 @@ class LLM(torch.nn.Module):
             fp.write(f'{len(speicals)} {len(self.stop_ids)} {len(prefix)}\n')
             write_line(fp, speicals, self.stop_ids, prefix)
 
-        file_path = os.path.join(self.mnn_path, "tokenizer.txt")
+        file_path = os.path.join(self.onnx_path, "tokenizer.txt")
         special_list = list(self.tokenizer.added_tokens_decoder.keys())
         if hasattr(self.tokenizer, 'special_tokens'):
             for k, v in self.tokenizer.special_tokens.items():
                 special_list.append(v)
+        if hasattr(self.tokenizer, 'gmask_token_id'):
+            special_list.append(self.tokenizer.gmask_token_id)
         vocab_list = []
         prefix_list = []
         if hasattr(self.tokenizer, 'get_prefix_tokens'):
@@ -589,16 +592,17 @@ class Chatglm_6b(LLM):
         if self.token_len:
             return torch.zeros([1]).bool().reshape([1, 1, 1, 1])
         attention_mask = torch.zeros([self.seq_len, self.seq_len], dtype=torch.bool)
-        for i in range(self.seq_len):
+        for i in range(self.seq_len - 1):
             attention_mask[i][-1] = True
         attention_mask = attention_mask.reshape([1, 1, self.seq_len, self.seq_len])
         return attention_mask
 
     def get_position_ids(self) -> torch.Tensor:
         if self.token_len:
-            return torch.tensor([1, self.seq_len - self.context_len]).reshape([1, 2, 1])
+            return torch.tensor([self.context_len, self.token_len + 1]).reshape([1, 2, 1])
         position_ids_0 = torch.arange(self.seq_len, dtype=torch.long)
         position_ids_1 = torch.zeros(self.seq_len, dtype=torch.long)
+        position_ids_0[-1] = position_ids_0[-2]
         position_ids_1[-1] = 1
         position_ids = torch.stack([position_ids_0, position_ids_1]).view(1, 2, -1)
         return position_ids
@@ -642,10 +646,11 @@ class Chatglm2_6b(LLM):
         self.blocks_ = transformer.encoder.layers
         self.final_layernorm_ = transformer.encoder.final_layernorm
         # some wrapper
-        self.stop_ids.append(self.tokenizer.eos_token_id)
-        if len(self.stop_ids) == 0:
+        if self.tokenizer.eos_token_id is None:
             # codegeex2-6b
             self.stop_ids.append(self.tokenizer.tokenizer.eos_id)
+        else:
+            self.stop_ids.append(self.tokenizer.eos_token_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
@@ -796,7 +801,7 @@ class Qwen_Chat(LLM):
     def get_attention_mask(self) -> torch.Tensor:
         if self.model_name == 'Qwen-VL':
             if self.token_len:
-                return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+                return torch.zeros([1, 1, 1, 1], dtype=torch.float32)
             return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
         if self.token_len:
             return torch.ones([1, 1, 1, 1]).bool()
@@ -949,7 +954,7 @@ class LLAMA2Block(torch.nn.Module):
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
-        rotary_pos_emb = rotary_pos_emb.unsqueeze(0).unsqueeze(0)
+        rotary_pos_emb = rotary_pos_emb.unsqueeze(1).unsqueeze(0)
         rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
         position_ids = position_ids.view(1, -1)
@@ -1009,18 +1014,18 @@ class Llama2_7b_Chat(LLM):
         else:
             self.num_key_value_heads = self.config.num_attention_heads
         self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.head_dim, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
-        self.past_kv_shape = [self.block_nums, 2, 1, self.num_key_value_heads, 0, self.head_dim]
+        self.past_kv_shape = [self.block_nums, 2, 1, 0, self.num_key_value_heads, self.head_dim]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 1: "seq_len" },
-            "past_key_values" : { 3: "history_len" }
+            "past_key_values" : { 2: "history_len" }
         }
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
             "position_ids" : { 1: "seq_len" },
-            "past_key_values" : { 4: "history_len" }
+            "past_key_values" : { 3: "history_len" }
         }
 
     def build_prompt(self, query):
@@ -1158,13 +1163,14 @@ class bge(LLM):
         return res
 
     def load_model(self):
+        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
         transformer = self.model.encoder
         self.lm_ = self.model.pooler
         self.embed_ = self.model.embeddings
         self.hidden_size = self.embed_.word_embeddings.weight.shape[-1]
         self.blocks_ = transformer.layer
         # some wrapper
-        self.stop_ids.append(self.tokenizer.eos_token_id)
+        self.stop_ids = []
         self.block_nums = len(self.blocks_)
         self.embed = self.embed_
         self.lm = self.lm_
