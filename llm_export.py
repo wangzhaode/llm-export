@@ -66,8 +66,8 @@ class Lm(torch.nn.Module):
 
     def forward(self, hidden_states):
         m_logits = self.lm(hidden_states)
-        token = torch.argmax(m_logits)
-        return token
+        # token = torch.argmax(m_logits)
+        return m_logits
 
 class LLM(torch.nn.Module):
     '''
@@ -116,7 +116,10 @@ class LLM(torch.nn.Module):
 
     def load_hf(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        except:
+            self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
         self.config = self.model.config
         if self.lora_path is not None:
             adapter = PeftModel.from_pretrained(self.model, model_id=self.lora_path)
@@ -149,11 +152,11 @@ class LLM(torch.nn.Module):
         for i in range(self.block_nums):
             hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])
             presents.append(kv)
-        token_id = self.lm(hidden_states).view(1)
+        logits = self.lm(hidden_states).reshape(-1)
         presents = torch.stack(presents)
         self.seq_len += 1
         self.token_len += 1
-        return token_id, presents
+        return logits, presents
 
     def forward(self, input_ids, attention_mask, position_ids, past_key_values):
         if self.without_embed:
@@ -188,7 +191,8 @@ class LLM(torch.nn.Module):
         while self.token_len < self.max_length:
             attention_mask = self.get_attention_mask()
             position_ids = self.get_position_ids()
-            token_id, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
+            logits, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
+            token_id = torch.argmax(logits)
             if token_id in self.stop_ids:
                 print("", end='\n')
                 break
@@ -218,7 +222,7 @@ class LLM(torch.nn.Module):
                         onnx_model,
                         verbose=self.export_verbose,
                         input_names=['hidden_states'],
-                        output_names=['token_id'],
+                        output_names=['logits'],
                         do_constant_folding=True,
                         opset_version=15)
         if not self.skip_slim:
@@ -361,13 +365,25 @@ class LLM(torch.nn.Module):
             input_names=[
                 'input_ids', 'attention_mask', 'position_ids', 'past_key_values'
             ],
-            output_names=['token_id', 'presents'],
+            output_names=['logits', 'presents'],
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
         print('export done!')
         if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
+            for file_path in glob.glob(f'./{self.onnx_path}/onnx__*'):
+                try:
+                    os.remove(file_path)
+                    print(f"The file {file_path} has been deleted.")
+                except FileNotFoundError:
+                    pass
+            for file_path in glob.glob(f'./{self.onnx_path}/model.*'):
+                try:
+                    os.remove(file_path)
+                    print(f"The file {file_path} has been deleted.")
+                except FileNotFoundError:
+                    pass
         if self.export_test:
             # test
             original_outs = model(input_ids, attention_mask, position_ids, past_key_values)
@@ -514,6 +530,7 @@ class GLMBlock(torch.nn.Module):
         super().__init__()
         self.block = block
         self.block_id = block_id
+        self.hidden_size = 4096
         self.final_layernorm = final_layernorm
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
@@ -831,6 +848,7 @@ class QWEN2Block(torch.nn.Module):
                                              past_key_value=past_kv,
                                              rotary_pos_emb=rotary_pos_emb,
                                              use_cache=True)
+
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
             hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
@@ -853,7 +871,7 @@ class Qwen2_Chat(LLM):
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.stop_ids.append(self.tokenizer.eos_token_id)
-        if hasattr(self.model, 'generation_config'):
+        if hasattr(model, 'generation_config'):
             for id in self.model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
         self.block_nums = self.config.num_hidden_layers
@@ -885,7 +903,8 @@ class Qwen2_Chat(LLM):
         }
 
     def build_prompt(self, query):
-        return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
+        # return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
+        return f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -917,20 +936,28 @@ class Qwen2_Chat(LLM):
 
 # llama2
 class LLAMA2Block(torch.nn.Module):
-    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
+    def __init__(self, block, block_id, hidden_size, head_dim, final_layernorm = None):
         super().__init__()
         self.block = block
         self.block_id = block_id
+        self.head_dim = head_dim
         self.final_layernorm = final_layernorm
         self.hidden_size = hidden_size
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        theta = 1.0 / (10000.0 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+        position_ids = position_ids.float().reshape(-1, 1)
+        idx_theta = position_ids * theta
+        rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
+        rotary_pos_emb = rotary_pos_emb.unsqueeze(0).unsqueeze(0)
+        rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
         position_ids = position_ids.view(1, -1)
         hidden_states, presents = self.block(hidden_states,
                                              attention_mask,
                                              position_ids,
                                              past_kv,
+                                             rotary_pos_emb=rotary_pos_emb,
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
@@ -973,12 +1000,15 @@ class Llama2_7b_Chat(LLM):
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         self.block_nums = self.config.num_hidden_layers
         self.hidden_size = self.config.hidden_size
         self.num_attention_heads = self.config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_attention_heads
-        self.num_key_value_heads = self.config.num_key_value_heads
+        if hasattr(self.config, 'num_key_value_heads'):
+            self.num_key_value_heads = self.config.num_key_value_heads
+        else:
+            self.num_key_value_heads = self.config.num_attention_heads
+        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.head_dim, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         self.past_kv_shape = [self.block_nums, 2, 1, self.num_key_value_heads, 0, self.head_dim]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
