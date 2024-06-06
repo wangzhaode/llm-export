@@ -98,11 +98,14 @@ class LLM(torch.nn.Module):
         self.skip_slim = args.skip_slim
         tokenizer_model = os.path.join(args.path, 'tokenizer.model')
         ice_text_model = os.path.join(args.path, 'ice_text.model')
-        if os.path.exists(tokenizer_model):
-            self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
-        elif os.path.exists(ice_text_model):
-            self.sp_model = spm.SentencePieceProcessor(ice_text_model)
-        else:
+        try:
+            if os.path.exists(tokenizer_model):
+                self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
+            elif os.path.exists(ice_text_model):
+                self.sp_model = spm.SentencePieceProcessor(ice_text_model)
+            else:
+                self.sp_model = None
+        except:
             self.sp_model = None
         merge_file = os.path.join(args.path, 'merges.txt')
         if os.path.exists(merge_file):
@@ -462,17 +465,19 @@ class LLM(torch.nn.Module):
             print('# tiktoken tokenier')
             # tikton
             vocab_list = []
-            special_list = []
             for k, v in self.tokenizer.mergeable_ranks.items():
                 line = base64.b64encode(k).decode("utf8") + "\n"
                 vocab_list.append(line)
             if hasattr(self.tokenizer, 'special_tokens'):
                 for k, v in self.tokenizer.special_tokens.items():
-                    special_list.append(v)
                     line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
                     vocab_list.append(line)
+            if hasattr(self.tokenizer, 'added_tokens_decoder'):
+                for k, v in self.tokenizer.added_tokens_decoder.items():
+                    line = base64.b64encode(v.__str__().encode("utf-8")).decode("utf8") + "\n"
+                    vocab_list.append(line)
             with open(file_path, "w", encoding="utf8") as fp:
-                write_header(fp, TIKTOIKEN, special_list)
+                write_header(fp, TIKTOIKEN, special_list, prefix_list)
                 fp.write(f'{len(vocab_list)}\n')
                 for vocab in vocab_list:
                     fp.write(vocab)
@@ -609,15 +614,18 @@ class Chatglm_6b(LLM):
 
 # chatglm2
 class GLM2Block(torch.nn.Module):
-    def __init__(self, block, block_id, final_layernorm = None):
+    def __init__(self, block, block_id, config, final_layernorm = None):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.config = config
         self.hidden_size = 4096
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
-        theta = 1.0 / (10000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+        rope_ratio = self.config.rope_ratio
+        base = 10000 * rope_ratio
+        theta = 1.0 / (base ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
         position_ids = position_ids.float().reshape(-1, 1)
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1).unsqueeze(0).contiguous()
@@ -651,10 +659,13 @@ class Chatglm2_6b(LLM):
             self.stop_ids.append(self.tokenizer.tokenizer.eos_id)
         else:
             self.stop_ids.append(self.tokenizer.eos_token_id)
+        if hasattr(self.config, 'eos_token_id'):
+            for eos_id in self.config.eos_token_id:
+                self.stop_ids.append(eos_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [GLM2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        self.blocks = [GLM2Block(self.blocks_[i], i, self.config, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.past_kv_shape = [28, 2, 0, 1, 2, 128]
         self.block_dynamic_axes = {
@@ -669,6 +680,21 @@ class Chatglm2_6b(LLM):
             "position_ids" : { 0: "seq_len" },
             "past_key_values" : { 2: "history_len" }
         }
+        num_layers = self.config.num_layers
+        if num_layers > 28:
+            self.past_kv_shape = [num_layers, 2, 1, 2, 0, 128]
+            self.block_dynamic_axes = {
+                "inputs_embeds" : { 0: "seq_len" },
+                "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+                "position_ids" : { 0: "seq_len" },
+                "past_key_values" : { 3: "history_len" }
+            }
+            self.model_dynamic_axes = {
+                "input_ids" : { 0: "seq_len" },
+                "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+                "position_ids" : { 0: "seq_len" },
+                "past_key_values" : { 4: "history_len" }
+            }
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -876,12 +902,13 @@ class Qwen2_Chat(LLM):
         self.final_layernorm_ = transformer.norm
         # some wrapper
         self.stop_ids.append(self.tokenizer.eos_token_id)
-        if hasattr(model, 'generation_config'):
+        if hasattr(self.model, 'generation_config'):
             for id in self.model.generation_config.eos_token_id:
                 self.stop_ids.append(id)
         self.block_nums = self.config.num_hidden_layers
         self.hidden_size = self.config.hidden_size
         self.num_heads = self.config.num_attention_heads
+        self.kv_heads = self.config.num_key_value_heads
         self.rope_theta = self.config.rope_theta
         self.head_dim = self.hidden_size // self.num_heads
         if self.embed_.weight is self.lm_.weight:
@@ -891,7 +918,7 @@ class Qwen2_Chat(LLM):
         else:
             self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.past_kv_shape = [self.block_nums, 2, 1, 0, self.num_heads, self.head_dim]
+        self.past_kv_shape = [self.block_nums, 2, 1, 0, self.kv_heads, self.head_dim]
         self.blocks = [QWEN2Block(self.model_name, self.blocks_[i], i, self.config, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.block_dynamic_axes = {
@@ -1261,8 +1288,9 @@ if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
         'chatglm2-6b': Chatglm2_6b,
-        'chatglm3-6b': Chatglm3_6b,
         'codegeex2-6b': Chatglm2_6b,
+        'chatglm3-6b': Chatglm3_6b,
+        'glm-4-9b-chat': Chatglm3_6b,
         'Qwen-7B-Chat': Qwen_Chat,
         'Qwen-1_8B-Chat': Qwen_Chat,
         'Qwen-1_8B': Qwen_Chat,
@@ -1271,6 +1299,9 @@ if __name__ == '__main__':
         'Qwen1_5-1_8B-Chat': Qwen2_Chat,
         'Qwen1_5-4B-Chat': Qwen2_Chat,
         'Qwen1_5-7B-Chat': Qwen2_Chat,
+        'Qwen2-0_5B-Instruct': Qwen2_Chat,
+        'Qwen2-1_5B-Instruct': Qwen2_Chat,
+        'Qwen2-7B-Instruct': Qwen2_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat,
         'Llama-3-8B-Instruct': Llama2_7b_Chat,
