@@ -1,6 +1,7 @@
 import os
 import base64
 import glob
+import json
 import shutil
 import argparse
 import torch
@@ -119,6 +120,14 @@ class LLM(torch.nn.Module):
         self.lora_path = args.lora_path
         self.load_hf(args.path)
         self.load_model()
+        self.llm_config = {
+            'hidden_size' : self.hidden_size,
+            'layer_nums' : self.block_nums,
+            'attention_mask': self.attention_mask_type,
+            'key_value_shape': self.past_kv_shape[1:],
+            "prompt_template": self.build_prompt('%s'),
+            'is_visual': False
+        }
 
     def load_hf(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -351,6 +360,11 @@ class LLM(torch.nn.Module):
         for i in range(self.block_nums):
             self.export_block(i)
 
+    def export_config(self, is_single = True):
+        self.llm_config['is_single'] = is_single
+        with open(f'./{self.onnx_path}/llm_config.json', 'w', encoding='utf-8') as f:
+            json.dump(self.llm_config, f, ensure_ascii=False, indent=4)
+
     def export(self):
         model = self
         self.seq_len = 3
@@ -557,8 +571,9 @@ class GLMBlock(torch.nn.Module):
 
 class Chatglm_6b(LLM):
     def __init__(self, args):
-        super().__init__(args)
+        self.attention_mask_type = 'glm'
         self.model_name = 'Chatglm_6b'
+        super().__init__(args)
 
     def load_model(self):
         transformer = self.model.transformer
@@ -612,6 +627,9 @@ class Chatglm_6b(LLM):
         position_ids = torch.stack([position_ids_0, position_ids_1]).view(1, 2, -1)
         return position_ids
 
+    def build_prompt(self, query):
+        return f'{query}[gMASK]<sop>'
+
 # chatglm2
 class GLM2Block(torch.nn.Module):
     def __init__(self, block, block_id, config, final_layernorm = None):
@@ -642,6 +660,7 @@ class GLM2Block(torch.nn.Module):
 
 class Chatglm2_6b(LLM):
     def __init__(self, args):
+        self.attention_mask_type = 'glm2'
         super().__init__(args)
         self.model_name = 'Chatglm2_6b'
         if 'codegeex2-6b' in args.path:
@@ -660,8 +679,11 @@ class Chatglm2_6b(LLM):
         else:
             self.stop_ids.append(self.tokenizer.eos_token_id)
         if hasattr(self.config, 'eos_token_id'):
-            for eos_id in self.config.eos_token_id:
-                self.stop_ids.append(eos_id)
+            if type(self.config.eos_token_id) is list:
+                for eos_id in self.config.eos_token_id:
+                    self.stop_ids.append(eos_id)
+            elif type(self.config.eos_token_id) is int:
+                self.stop_ids.append(self.config.eos_token_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
@@ -776,7 +798,17 @@ class QWEN18Block(torch.nn.Module):
 
 class Qwen_Chat(LLM):
     def __init__(self, args):
+        self.attention_mask_type = 'int'
         super().__init__(args)
+        if 'VL' in self.model_name:
+            self.llm_config['is_visual'] = True
+            self.llm_config['attention_mask'] = 'float'
+            self.llm_config['img_size'] = 448
+            self.llm_config['imgpad_len'] = 256
+            self.llm_config['img_start'] = self.tokenizer.img_start_id
+            self.llm_config['img_end'] = self.tokenizer.img_end_id
+            self.llm_config['img_pad'] = self.tokenizer.img_pad_id
+
 
     def load_model(self):
         # Qwen models
@@ -890,6 +922,7 @@ class QWEN2Block(torch.nn.Module):
 
 class Qwen2_Chat(LLM):
     def __init__(self, args):
+        self.attention_mask_type = 'float'
         super().__init__(args)
 
     def load_model(self):
@@ -935,8 +968,7 @@ class Qwen2_Chat(LLM):
         }
 
     def build_prompt(self, query):
-        # return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
-        return f'<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
+        return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -1000,6 +1032,7 @@ class LLAMA2Block(torch.nn.Module):
 
 class Llama2_7b_Chat(LLM):
     def __init__(self, args):
+        self.attention_mask_type = 'float'
         self.model_name = 'Llama2_7b'
         if 'Baichuan2' in args.path:
             self.model_name = 'Baichuan2_7B'
@@ -1065,10 +1098,10 @@ class Llama2_7b_Chat(LLM):
         if 'Yi' in self.model_name:
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
         if 'deepseek' in self.model_name:
-            return f'<|begin▁of▁sentence|>User: {query}\nAssistant:'
+            return f'<|begin_of_sentence|>User: {query}\n\nAssistant:'
         if 'Llama3' in self.model_name:
             return f'<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
-        return f'[INST]{query}[/INST]'
+        return f'<s>[INST]{query}[/INST]'
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.token_len:
@@ -1105,6 +1138,7 @@ class PHI2Block(torch.nn.Module):
 
 class phi_2(LLM):
     def __init__(self, args):
+        self.attention_mask_type = 'glm'
         super().__init__(args)
         self.model_name = 'phi-2'
         self.asymmetric = False # TODO: some precision bug when using asymmetric
@@ -1165,6 +1199,8 @@ class BGEBlock(torch.nn.Module):
 
 class bge(LLM):
     def __init__(self, args):
+        self.attention_mask_type = 'int'
+        self.past_kv_shape = []
         super().__init__(args)
         self.model_name = 'bge-large-zh'
 
@@ -1255,6 +1291,9 @@ class bge(LLM):
 
         if self.export_mnn:
             onnx2mnn(onnx_model, self.mnn_path, 8, True, bizCode=token_str)
+
+    def build_prompt(self, query):
+            return f'[CLS]{query}[SEP]'
 
     def get_position_ids(self) -> torch.Tensor:
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
@@ -1367,6 +1406,9 @@ if __name__ == '__main__':
     # some actions
     if args.test is not None:
         llm_exporter.response(args.test)
+
+    if args.export or args.export_split:
+        llm_exporter.export_config(args.export)
 
     if args.export:
         llm_exporter.export()
