@@ -6,8 +6,9 @@ llm-export is a tool for exporting llm models, capable of converting llm models 
 - 🚀 All passed `onnxruntime` correctness tests
 - 🚀 Optimized the original code to support dynamic shapes
 - 🚀 Optimized the original code to reduce the constant portion
-- 🚀 Using [OnnxSlim](https://github.com/WeLoveAI/OnnxSlim) slim onnx model，speed up 5%; by [@inisis](https://github.com/inisis)
+- 🚀 Using [OnnxSlim](https://github.com/inisis/OnnxSlim) slim onnx model，speed up 5%; by [@inisis](https://github.com/inisis)
 - 🚀 Support export lora weight to onnx or MNN model
+- 🚀 Onnx inference code [OnnxLLM](https://github.com/inisis/OnnxLLM)
 
 ## Model Support and Downloads
 
