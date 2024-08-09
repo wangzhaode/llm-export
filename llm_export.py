@@ -1408,7 +1408,8 @@ if __name__ == '__main__':
         llm_exporter.response(args.test)
 
     if args.export or args.export_split:
-        llm_exporter.export_config(args.export)
+        if hasattr(llm_exporter, "export_config"):
+            llm_exporter.export_config(args.export)
 
     if args.export:
         llm_exporter.export()
