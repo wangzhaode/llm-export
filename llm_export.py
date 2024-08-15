@@ -1,54 +1,65 @@
 import os
+import sys
 import math
 import copy
 import glob
 import json
+import time
 import base64
-import shutil
+import logging
+import warnings
 import argparse
-from typing import List, Optional, Tuple, Union
+import functools
+from typing import Optional, Tuple
+
+from yaspin import yaspin
 
 import torch
 import numpy as np
-import onnxruntime as ort
-from onnxslim import slim
+# transformers
 import sentencepiece as spm
-from transformers.modeling_utils import PreTrainedModel
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+# export to onnx
+import onnx
+from onnx import helper
+from onnxslim import slim
+from torch.onnx.symbolic_helper import _get_tensor_sizes
+# export to mnn
+from MNN.tools import mnnconvert
 
-try:
-    import _tools as MNNTools
-except:
-    MNNTools = None
+RESET = "\033[0m"
+GREEN = "\033[32;1m"
+YELLOW = "\033[33;4m"
+EXPORT_LOG = 'export.log'
 
-def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data = False, bizCode : str= None):
-    model_name, model_extension = os.path.splitext(os.path.basename(onnx_path))
-    if model_extension != '.onnx':
-        return
-    mnn_name = model_name + '.mnn'
-    mnn_path = os.path.join(mnn_dir, mnn_name)
-    convert_args = [
-        '',
-        '-f',
-        'ONNX',
-        '--modelFile',
-        str(onnx_path),
-        '--MNNModel',
-        str(mnn_path),
-        '--weightQuantBits',
-        str(quant_bit),
-    ]
-    if asymmetric:
-        convert_args.append("--weightQuantAsymmetric")
-    if external_data:
-        convert_args.append("--saveExternalData")
-    if bizCode is not None:
-        convert_args.append("--bizCode")
-        convert_args.append(str(bizCode))
-    MNNTools.mnnconvert(convert_args)
+# ignore warnning info
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.ERROR)
+
+def spinner_run(text='Processing...'):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with yaspin(text=text, color="cyan") as spinner:
+                start = time.time()
+                try:
+                    result = func(*args, **kwargs)
+                except Exception as e:
+                    spinner.fail("💥 Failed")
+                    print(e)
+                    exit(1)
+                end = time.time()
+                during = f'[{end-start:05.2f} s]'.replace('[0', '[ ')
+                padding = ' ' * (64 - len(spinner.text) - len(result))
+                spinner.text = f'{spinner.text}{YELLOW}{result}{RESET}{padding}{GREEN}{during}{RESET}'
+                spinner.ok("✅ Done")
+                return result
+        return wrapper
+    return decorator
 
 class ModelMapper:
     def __init__(self):
+        self.attrs = []
         self.mapper = dict()
         self.regist_models()
 
@@ -244,23 +255,384 @@ class ModelMapper:
                     break
             setattr(dst, dst_attr, obj)
 
+
+# Export class
+class LlmExporterOp(torch.autograd.Function):
+    @staticmethod
+    def symbolic(g, input, in_features, out_features, has_bias, name):
+        args = [input]
+        # These become the operator attributes.
+        kwargs = {
+            "in_features_i": in_features,
+            "out_features_i": out_features,
+            "has_bias_i": has_bias,
+            "name_s": name
+        }
+        out_sizes = _get_tensor_sizes(input)[:-1] + [out_features]
+        output_type = input.type().with_sizes(out_sizes)
+        return g.op("LlmExporter::FakeLinear", input, **kwargs).setType(output_type)
+
+    @staticmethod
+    def forward(ctx, input, in_features, out_features, has_bias, name):
+        out_shape = list(input.shape)[:-1] + [out_features]
+        return input.new_zeros(out_shape)
+
+class FakeLinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, has_bias, name):
+        super(FakeLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.has_bias = has_bias
+        self.name = name
+
+    def forward(self, x):
+        return LlmExporterOp.apply(x, self.in_features, self.out_features, self.has_bias, self.name)
+
+class OnnxRebuilder:
+    def __init__(self, onnx_path, weight_ops):
+        self.weight_ops = weight_ops
+        self.onnx_model = onnx.load(onnx_path)
+        self.dst_path = onnx_path
+        self.onnx_weight_path = f'{os.path.basename(onnx_path)}.data'
+        self.onnx_weight_offset = 0
+
+    def make_external(self, name, data, shape):
+        # write to external weight
+        length = self.onnx_weight.write(data.tobytes())
+        location = self.onnx_weight_path
+        offset = self.onnx_weight_offset
+        self.onnx_weight_offset += length
+        tensor = onnx.TensorProto()
+        tensor.name = name
+        tensor.data_type = onnx.TensorProto.FLOAT
+        tensor.dims.extend(shape)
+        # external info
+        tensor.data_location = onnx.TensorProto.EXTERNAL
+        for k, v in { "location": location, "offset": offset, "length": length }.items():
+            entry = tensor.external_data.add()
+            entry.key = k
+            entry.value = str(v)
+        self.onnx_model.graph.initializer.append(tensor)
+
+    def build_weight(self, name, has_bias, ic, oc):
+        assert(name in self.weight_ops)
+        linear = self.weight_ops[name]
+        assert(linear.in_features == ic and
+               linear.out_features == oc and
+               (linear.bias is not None) == has_bias)
+        weight_name, bias_name = f'{name}_weight', f'{name}_bias'
+        weight = linear.weight.data.transpose(1, 0).flatten().numpy()
+        self.make_external(weight_name, weight, [ic, oc])
+        if has_bias:
+            bias = linear.bias.data.flatten().numpy()
+            self.make_external(bias_name, bias, [oc])
+        return weight_name, bias_name
+
+    def rebuild(self):
+        new_nodes = []
+        self.onnx_weight = open(self.onnx_weight_path, 'wb')
+        for node in self.onnx_model.graph.node:
+            if node.op_type == 'FakeLinear':
+                attributes = {a.name: a for a in node.attribute}
+                name = attributes.get('name').s.decode('utf-8')
+                has_bias = attributes.get('has_bias').i
+                ic = attributes.get('in_features').i
+                oc = attributes.get('out_features').i
+                weight, bias = self.build_weight(name, has_bias, ic, oc)
+                if has_bias:
+                    # fakelinear -> matmul + add
+                    middle_tensor = f'{name}_matmul'
+                    new_nodes.append(helper.make_node('MatMul', [node.input[0], weight], [middle_tensor], name))
+                    new_nodes.append(helper.make_node('Add', [middle_tensor, bias], node.output, name))
+                else:
+                    # fakelinear -> matmul
+                    new_nodes.append(helper.make_node('MatMul', [node.input[0], weight], node.output, name))
+            else:
+                new_nodes.append(node)
+        self.onnx_weight.close()
+        del self.onnx_model.graph.node[:]
+        self.onnx_model.graph.node.extend(new_nodes)
+        onnx.save(self.onnx_model, self.dst_path)
+        return self.onnx_weight_path
+
+class MNNConveter:
+    def __init__(self, onnx_path, weight_ops, quant_bit = 4,quant_block = 0):
+        self.weight_ops = weight_ops
+        self.quant_block = quant_block
+        self.quant_bit = quant_bit
+        self.mnn_weight_offset = 0
+        self.onnx_model_path = onnx_path
+        self.mnn_model_path = onnx_path.replace('.onnx', '.mnn')
+        self.mnn_weight_path = f'{self.mnn_model_path}.weight'
+
+    @staticmethod
+    def convert(convert_args):
+        sfd = os.dup(1)
+        log_fp = open(EXPORT_LOG, "a")
+        log_fd = log_fp.fileno()
+        # mnnconvert ... > .convert_mnn.log
+        os.dup2(log_fd, 1)
+        try:
+            sys.argv = convert_args
+            sys.argc = len(convert_args)
+            mnnconvert.main()
+            sys.argv = []
+        finally:
+            os.dup2(sfd, 1)
+            os.close(log_fd)
+
+    @staticmethod
+    @spinner_run(f'convert onnx model to ')
+    def onnx2mnn(onnx_path, mnn_path, args = []):
+        convert_args = [
+            '',
+            '-f',
+            'ONNX',
+            '--modelFile',
+            str(onnx_path),
+            '--MNNModel',
+            str(mnn_path),
+            '--transformerFuse',
+            '--allowCustomOp'
+        ]
+        convert_args += args
+        MNNConveter.convert(convert_args)
+        return mnn_path
+
+    @staticmethod
+    def mnn2json(mnn_path, json_path):
+        convert_args = [
+            '',
+            '-f',
+            'MNN',
+            '--modelFile',
+            str(mnn_path),
+            '--JsonFile',
+            str(json_path)
+        ]
+        MNNConveter.convert(convert_args)
+        return json_path
+
+    @staticmethod
+    def json2mnn(json_path, mnn_path):
+        convert_args = [
+            '',
+            '-f',
+            'JSON',
+            '--modelFile',
+            str(json_path),
+            '--MNNModel',
+            str(mnn_path)
+        ]
+        MNNConveter.convert(convert_args)
+        return mnn_path
+
+    def export(self):
+        if self.weight_ops is None:
+            quant_args = [
+                '--weightQuantBits',
+                str(self.quant_bit),
+                '--weightQuantBlock',
+                str(self.quant_block)
+            ]
+            MNNConveter.onnx2mnn(self.onnx_model_path, self.mnn_model_path, quant_args)
+        else:
+            mnn_json = f'{self.mnn_model_path}.json'
+            MNNConveter.onnx2mnn(self.onnx_model_path, self.mnn_model_path)
+            MNNConveter.mnn2json(self.mnn_model_path, mnn_json)
+            self.rebuild(mnn_json)
+            MNNConveter.json2mnn(mnn_json, self.mnn_model_path)
+
+    @spinner_run(f'quant model weight to ')
+    def rebuild(self, json_path):
+        self.mnn_weight = open(self.mnn_weight_path, 'wb')
+        mnn_graph = json.load(open(json_path, 'rt'))
+        new_ops = []
+        for op in mnn_graph['oplists']:
+            if op['type'] == 'Extra':
+                new_ops += self.rebuild_op(op, mnn_graph)
+            else:
+                new_ops.append(op)
+        mnn_graph['oplists'] = new_ops
+        with open(json_path, 'w', encoding='utf-8') as file:
+            json.dump(mnn_graph, file, ensure_ascii=False, indent=4)
+        return self.mnn_weight_path
+
+    def quant(self, weight):
+        weight = weight.numpy()
+        oc, ic = weight.shape
+        if self.quant_block == 0:
+            block_size = ic
+        else:
+            block_size = self.quant_block
+        block_num = ic // block_size
+        weight = weight.reshape(oc, block_num, block_size)
+        max_val = np.max(weight, axis=-1, keepdims=True)
+        min_val = np.min(weight, axis=-1, keepdims=True)
+        offset = 1 << (self.quant_bit - 1)
+        clip_max = offset - 1
+        clip_min = -offset
+        scale = (max_val - min_val) / (clip_max - clip_min)
+        q_weight = np.round((weight - min_val) / scale).astype(np.int8) + clip_min
+        q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
+        q_weight = q_weight.reshape(-1, 2)
+        if self.quant_bit == 4:
+            q_weight = q_weight[:, 0] * 16 + q_weight[:, 1]
+        alpha = np.stack([min_val.flatten(), scale.flatten()], axis=-1).flatten()
+        return q_weight, alpha, clip_min
+
+    def write_npy(self, data):
+        return self.mnn_weight.write(data.tobytes())
+
+    def write_header(self, ic, oc):
+        dim_num = self.mnn_weight.write(b'\x02')
+        shape_dtype = np.int16
+        if oc > 65535 or ic > 65535:
+            shape_dtype = np.int32
+        dim_length = self.write_npy(np.array([oc, ic]).astype(shape_dtype))
+        offset = 1 << (self.quant_bit - 1)
+        weight_map = [i for i in range(-offset, offset)]
+        weight_map.insert(0, len(weight_map))
+        map_length = self.write_npy(np.array(weight_map, dtype=np.int8))
+        header_length = dim_num + dim_length + map_length
+        return header_length, shape_dtype == np.int32
+
+    def build_weight(self, linear):
+        ic, oc = linear.in_features, linear.out_features
+        q_weight, alpha, q_min = self.quant(linear.weight.data)
+        header_len, shape_int32 = self.write_header(ic, oc)
+        weight_len = self.write_npy(q_weight) + header_len
+        alpha_len = self.write_npy(alpha)
+        if linear.bias is not None:
+            bias = linear.bias.data.flatten().numpy()
+            bias_length = self.write_npy(bias)
+        else:
+            bias_length = 0
+            # bias = np.zeros([oc], dtype=np.float32)
+            # bias_length = self.write_npy(bias)
+        external = [self.mnn_weight_offset, weight_len, alpha_len, bias_length, 0]
+        self.mnn_weight_offset += (weight_len + alpha_len + bias_length)
+        return external, q_min, shape_int32
+
+    def build_tensor(self, graph, tensor_name):
+        tensor_idx = [len(graph['tensorName'])]
+        graph['tensorName'].append(tensor_name)
+        return tensor_idx
+
+    def rebuild_op(self, op, graph):
+        attrs = op['main']['attr']
+        for attr in attrs:
+            if attr['key'] == 'name':
+                name = attr['s']
+            elif attr['key'] == "in_features":
+                ic = attr["i"]
+            elif attr['key'] == "out_features":
+                oc = attr["i"]
+            elif attr['key'] == "has_bias":
+                has_bias = attr["i"]
+        linear = self.weight_ops[name]
+        assert(linear.in_features == ic and
+               linear.out_features == oc and
+               (linear.bias is not None) == has_bias)
+
+        external, q_min, shape_int32 = self.build_weight(linear)
+
+        origin_input = op['inputIndexes']
+        origin_output = op['outputIndexes']
+        # build new tensor
+        pre_reshape_name = f'{name}/pre_reshape'
+        pre_convert_name = f'{name}/pre_convert'
+        conv_name = name
+        post_convert_name = f'{name}/post_convert'
+        post_reshape_name = f'{name}/post_reshape'
+        pre_reshape_output = self.build_tensor(graph, pre_reshape_name)
+        pre_convert_output = self.build_tensor(graph, pre_convert_name)
+        conv_output = self.build_tensor(graph, conv_name)
+        post_convert_output = self.build_tensor(graph, post_convert_name)
+        # [batch, seq, hidden_size_i] -[Linear] -> [batch, seq, hidden_size_o]
+        # [1, seq, hidden_size_i] ->[Reshape]-> [seq, hidden_size_i, 1, 1]
+        # -[Convert]-[Convolution]-[Convert]-> [Reshape] -> [1, seq, hidden_size_o]
+        pre_reshape = {
+            "name": pre_reshape_name,
+            "type": "Reshape",
+            "inputIndexes": origin_input,
+            "outputIndexes": pre_reshape_output,
+            "main_type": "Reshape",
+            "main": {
+                "dims": [-1, ic, 1, 1],
+                "dimType": "NCHW"
+            },
+            "defaultDimentionFormat": "NHWC"
+        }
+        pre_convert = {
+            "name": pre_convert_name,
+            "inputIndexes": pre_reshape_output,
+            "outputIndexes": pre_convert_output,
+            "type": "ConvertTensor",
+            "main_type": "TensorConvertInfo",
+            "main": {
+                "source": "NCHW",
+                "dest": "NC4HW4"
+            },
+            "defaultDimentionFormat": "NHWC"
+        }
+        conv_op = {
+            "name": conv_name,
+            "inputIndexes": pre_convert_output,
+            "outputIndexes": conv_output,
+            "type": "Convolution",
+            "main_type": "Convolution2D",
+            "main": {
+                'common': {
+                    'dilateX': 1, 'dilateY': 1, 'strideX': 1, 'strideY': 1,
+                    'kernelX': 1, 'kernelY': 1, 'padX': 0, 'padY': 0, 'group': 1,
+                    'outputCount': oc, 'relu': False, 'padMode': 'CAFFE',
+                    'relu6': False, 'inputCount': ic, 'hasOutputShape': False
+                },
+                "quanParameter": {
+                    "quantScale": 1.0, "scaleIn": 0.0, "scaleOut": 0.0,
+                    "useInt32": False, "has_scaleInt": False, "shapeInt32": shape_int32,
+                    "type": 1, "aMax": 0, "aMin": q_min, "readType": oc, "weightSize": 0
+                },
+                "external": external
+            },
+            "defaultDimentionFormat": "NHWC"
+        }
+        post_convert = {
+            "name": post_convert_name,
+            "inputIndexes": conv_output,
+            "outputIndexes": post_convert_output,
+            "type": "ConvertTensor",
+            "main_type": "TensorConvertInfo",
+            "main": {
+                "source": "NC4HW4",
+                "dest": "NCHW"
+            },
+            "defaultDimentionFormat": "NHWC"
+        }
+        post_reshape = {
+            "name": post_reshape_name,
+            "type": "Reshape",
+            "inputIndexes": post_convert_output,
+            "outputIndexes": origin_output,
+            "main_type": "Reshape",
+            "main": {
+                "dims": [1, -1, oc],
+                "dimType": "NCHW"
+            },
+            "defaultDimentionFormat": "NHWC"
+        }
+        return [pre_reshape, pre_convert, conv_op, post_convert, post_reshape]
+
 # some wrapper class for export
 class Embedding(torch.nn.Module):
     def __init__(self, embed, config):
         super().__init__()
-        self.bf16 = config.embed_bf16
         self.hidden_size = config.hidden_size
-        if self.bf16:
-            # using bf16 embedding weight
-            self.embed = embed.bfloat16()
-        else:
-            self.embed = embed
+        self.embed = embed
 
     def forward(self, input_ids):
-        res = self.embed(input_ids)
-        if self.bf16:
-            res = res.float()
-        return res.view(-1, 1, self.hidden_size)
+        return self.embed(input_ids).view(-1, 1, self.hidden_size)
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
@@ -287,9 +659,9 @@ class Attention(torch.nn.Module):
                 qkv_hidden_size = self.qkv_proj.weight.shape[0]
                 kv_hidden_size = (qkv_hidden_size - self.hidden_size) // 2
                 split_sizes = [self.hidden_size, kv_hidden_size, kv_hidden_size]
-            self.q_proj = torch.nn.Linear(self.hidden_size, self.hidden_size)
-            self.k_proj = torch.nn.Linear(self.hidden_size, self.hidden_size)
-            self.v_proj = torch.nn.Linear(self.hidden_size, self.hidden_size)
+            self.q_proj = torch.nn.Linear(self.hidden_size, split_sizes[0])
+            self.k_proj = torch.nn.Linear(self.hidden_size, split_sizes[1])
+            self.v_proj = torch.nn.Linear(self.hidden_size, split_sizes[2])
             if config.model_type == 'chatglm':
                 # chatglm-6b
                 qkv_weight = self.qkv_proj.weight.data.view(self.num_heads, 3, self.head_dim, self.hidden_size)
@@ -331,7 +703,7 @@ class Attention(torch.nn.Module):
             kv_seq_len += past_key_value[0].shape[1]
 
         # rope
-        cos, sin = rotary_pos_emb
+        cos, sin = rotary_pos_emb[0], rotary_pos_emb[1]
         query_states = self.rotary.apply_rotary_pos(query_states, cos, sin)
         key_states = self.rotary.apply_rotary_pos(key_states, cos, sin)
         # kv cache
@@ -438,7 +810,6 @@ class Decoder(torch.nn.Module):
         ModelMapper.do_map(self, decoder, config.model_map['decoder'])
         self.hidden_size = config.hidden_size
         self.self_attn = Attention(self.self_attn, config)
-        self.original = decoder
         # chatglm
         self.alpha = (2 * config.num_hidden_layers) ** 0.5 if config.model_type == 'chatglm' else 1.0
 
@@ -504,28 +875,20 @@ class LlmExporter(torch.nn.Module):
         self.load_model(args.path)
 
     def init_from_args(self, args):
-        self.quant_bit = 4
-        self.asymmetric = True
         self.max_length = 1024
         self.stop_ids = []
         self.visual = None
-        self.without_embed = False
+        self.withou_embedding = False
         # load config from args
         self.model_name = args.path
+        self.dst_path = args.dst_path
         self.lora_path = args.lora_path
-        self.onnx_path = args.onnx_path
-        self.mnn_path = args.mnn_path
-        self.export_mnn = args.export_mnn
-        self.embed_bin = args.embed_bin
-        self.export_test = args.export_test
         self.skip_slim = args.skip_slim
-        self.export_verbose = args.export_verbose
-        self.embed_bf16 = args.embed_bf16 or args.embed_bin
-        # init export dir
-        if not os.path.exists(self.onnx_path):
-            os.makedirs(self.onnx_path)
-        if not os.path.exists(self.mnn_path):
-            os.makedirs(self.mnn_path)
+        self.quant_bit = args.quant_bit
+        self.quant_block = args.quant_block
+        # init export dst dir
+        if not os.path.exists(self.dst_path):
+            os.makedirs(self.dst_path)
 
     def load_pretrained(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -539,6 +902,7 @@ class LlmExporter(torch.nn.Module):
             adapter = PeftModel.from_pretrained(self.model, model_id=self.lora_path)
             self.model = adapter.merge_and_unload(progressbar=True)
 
+    @spinner_run(f'load pretrained model ')
     def load_model(self, model_path):
         self.load_pretrained(model_path)
         self.attention_mask_type = 'float'
@@ -557,8 +921,8 @@ class LlmExporter(torch.nn.Module):
 
         model_mapper = ModelMapper()
         self.model_type, self.model_map = model_mapper.get_map(self.config)
-        print(self.model)
-        print(self.model_type, self.model_map)
+        # print(self.model)
+        # print(self.model_type, self.model_map)
         # load config info
         ModelMapper.do_map(self, self.config, self.model_map['config'])
         if not hasattr(self, 'num_key_value_heads') or self.num_key_value_heads is None:
@@ -613,6 +977,7 @@ class LlmExporter(torch.nn.Module):
             self.llm_config['img_start'] = self.tokenizer.img_start_id
             self.llm_config['img_end'] = self.tokenizer.img_end_id
             self.llm_config['img_pad'] = self.tokenizer.img_pad_id
+        return model_path
 
     def get_attention_mask(self) -> torch.Tensor:
         if self.model_type == 'chatglm':
@@ -684,7 +1049,7 @@ class LlmExporter(torch.nn.Module):
         return logits, presents
 
     def forward(self, input_ids, attention_mask, position_ids, past_key_values):
-        if self.without_embed:
+        if self.withou_embedding:
             return self.forward_impl(input_ids, attention_mask, position_ids, past_key_values)
         return self.forward_impl(self.embedding(input_ids), attention_mask, position_ids, past_key_values)
 
@@ -748,55 +1113,14 @@ class LlmExporter(torch.nn.Module):
             word = self.id_to_str(token_id)
             print(word, end="", flush=True)
 
-    # some export functions
-    def assert_equal(self, torch_outs, onnx_outs):
-        if type(torch_outs) not in (list, tuple):
-            torch_outs = (torch_outs, )
-            onnx_outs = (onnx_outs, )
-        same = True
-        for orig, onnx in zip(torch_outs, onnx_outs):
-            orig = orig.detach().numpy()
-            if not np.allclose(orig, onnx, rtol=1e-3, atol=1e-3):
-                print('Error: onnx outputs dont match original. [shape = {}] onnx: {}, original: {}'.format(onnx.shape, onnx, orig))
-                same = False
-                break
-        if same:
-            print('onnx test SUCCESS')
-
-    def export_lm(self):
-        model = self.lm
-        hidden_states = torch.randn(1, self.hidden_size)
-        onnx_model = f'./{self.onnx_path}/lm.onnx'
-        torch.onnx.export(model, (hidden_states),
-                        onnx_model,
-                        verbose=self.export_verbose,
-                        input_names=['hidden_states'],
-                        output_names=['logits'],
-                        do_constant_folding=True,
-                        opset_version=15)
-        if not self.skip_slim:
-            slim(onnx_model, output_model=onnx_model)
-        # test lm
-        if self.export_test:
-            original_outs = model(hidden_states)
-            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-            inputs = {
-                'hidden_states' : hidden_states.numpy(),
-            }
-            onnx_outs = ort_session.run(None, inputs)
-            self.assert_equal(original_outs, onnx_outs)
-        if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
-
     def export_visual(self):
         if self.visual is None:
             return
         input_images = torch.randn((1, 3, self.image_size, self.image_size))
         model = self.visual
-        onnx_model = f'./{self.onnx_path}/visual.onnx'
+        onnx_model = f'{self.dst_path}/visual.onnx'
         torch.onnx.export(model, (input_images),
                         onnx_model,
-                        verbose=self.export_verbose,
                         input_names=['input_images'],
                         output_names=['image_embeds'],
                         dynamic_axes={"input_images": {
@@ -804,102 +1128,84 @@ class LlmExporter(torch.nn.Module):
                         }},
                         do_constant_folding=True,
                         opset_version=15)
+        return onnx_model
         if not self.skip_slim:
             slim(onnx_model, output_model=onnx_model)
-        # test
-        if self.export_test:
-            original_outs = model(input_images)
-            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-            inputs = {
-                'input_images' : input_images.numpy(),
-            }
-            onnx_outs = ort_session.run(None, inputs)[0]
-            self.assert_equal(original_outs, onnx_outs)
-        if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path)
 
+    @spinner_run(f'export embedding to ')
     def export_embed(self):
-        model = self.embed
-        if self.embed_bin:
-            import ctypes
-            tensor_data = model.embed.weight.data
-            data_ptr = tensor_data.untyped_storage().data_ptr()
-            buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
-            with open(f'./{self.onnx_path}/embeddings_bf16.bin', 'wb') as f:
-                f.write(buffer)
+        if not hasattr(self, 'embed') or not isinstance(self.embed.embed, torch.nn.Embedding):
             return
-        input_ids = torch.arange(3, dtype=torch.long)
-        onnx_model = f'./{self.onnx_path}/embedding.onnx'
-        torch.onnx.export(model, (input_ids),
-                        onnx_model,
-                        verbose=self.export_verbose,
-                        input_names=['input_ids'],
-                        output_names=['inputs_embeds'],
-                        dynamic_axes={"input_ids": {
-                            0: "length"
-                        }},
-                        do_constant_folding=True,
-                        opset_version=15)
-        if not self.skip_slim:
-            slim(onnx_model, output_model=onnx_model)
-        # test
-        if self.export_test:
-            original_outs = model(input_ids)
-            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-            inputs = {
-                'input_ids' : input_ids.numpy(),
-            }
-            onnx_outs = ort_session.run(None, inputs)
-            self.assert_equal(original_outs, onnx_outs)
-        if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path)
+        import ctypes
+        tensor_data = self.embed.embed.weight.data.bfloat16()
+        data_ptr = tensor_data.untyped_storage().data_ptr()
+        buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
+        embedding_file = f'{self.dst_path}/embeddings_bf16.bin'
+        with open(embedding_file, 'wb') as f:
+            f.write(buffer)
+        return embedding_file
 
-    def export_block(self, block_id: int):
-        self.seq_len = 3
-        self.token_len = 0
-        inputs_embeds = torch.randn((self.seq_len, 1, self.hidden_size))
-        attention_mask =  self.get_attention_mask()
-        position_ids = self.get_position_ids()
-        past_key_values = torch.zeros(self.past_kv_shape[1:])
-        model = self.blocks[block_id]
-        onnx_model = f'./{self.onnx_path}/block_{block_id}.onnx'
+    @spinner_run(f'export config to ')
+    def export_config(self):
+        config_json = f'{self.dst_path}/llm_config.json'
+        with open(config_json, 'w', encoding='utf-8') as f:
+            json.dump(self.llm_config, f, ensure_ascii=False, indent=4)
+        with open(f'{self.dst_path}/config.json', 'w', encoding='utf-8') as f:
+            config = {
+                "llm_model": "llm.mnn",
+                "llm_weight": "llm.mnn.weight",
+                "backend_type": "cpu",
+                "thread_num": 4,
+                "precision": "low",
+                "memory": "low"
+            }
+            json.dump(config, f, ensure_ascii=False, indent=4)
+        return config_json
+
+    def unload_param(self):
+        self.unloaded_ops = {}
+        def build_faker(real, name):
+            faker = FakeLinear(real.in_features, real.out_features, real.bias is not None, name)
+            self.unloaded_ops[name] = real
+            return faker
+        # replace linear with fakelinear to save export memory and time
+        with torch.no_grad():
+            for i in range(self.num_hidden_layers):
+                for name, child in self.blocks[i].self_attn.named_children():
+                    if isinstance(child, torch.nn.Linear):
+                        setattr(self.blocks[i].self_attn, name, build_faker(child, f'/layers.{i}/self_attn/{name}/Linear'))
+                for name, child in self.blocks[i].mlp.named_children():
+                    if isinstance(child, torch.nn.Linear):
+                        setattr(self.blocks[i].mlp, name, build_faker(child, f'/layers.{i}/mlp/{name}/Linear'))
+            self.lm.lm = build_faker(self.lm.lm, f'/lm/lm_head/Linear')
+
+    @spinner_run(f'export model weight to ')
+    def onnx_load_param(self, onnx_path):
+        return OnnxRebuilder(onnx_path, self.unloaded_ops).rebuild()
+
+    def onnx_export(self, model, onnx_model, inputs, input_names, output_names, dynamic_axes):
         torch.onnx.export(
-            model, (inputs_embeds, attention_mask, position_ids, past_key_values),
+            model, inputs,
             onnx_model,
-            verbose=self.export_verbose,
-            input_names=[
-                'inputs_embeds', 'attention_mask', 'position_ids', 'past_key_values'
-            ],
-            output_names=['hidden_states', 'presents'],
-            dynamic_axes=self.block_dynamic_axes,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        if not self.skip_slim:
+
+    @spinner_run(f'slim the graph of ')
+    def onnx_slim(self, onnx_model):
+        stdout = sys.stdout
+        with open(EXPORT_LOG, 'a') as f:
+            sys.stdout = f
             slim(onnx_model, output_model=onnx_model)
-        if self.export_test:
-            original_outs = model(inputs_embeds, attention_mask, position_ids, past_key_values)
-            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-            inputs = {
-                'inputs_embeds' : inputs_embeds.detach().numpy(),
-                'attention_mask' : attention_mask.numpy(),
-                'position_ids' : position_ids.numpy(),
-                'past_key_values' : past_key_values.numpy()
-            }
-            onnx_outs = ort_session.run(None, inputs)
-            self.assert_equal(original_outs, onnx_outs)
-        if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
+        sys.stdout = stdout
+        return onnx_model
 
-    def export_blocks(self):
-        for i in range(self.num_hidden_layers):
-            self.export_block(i)
-
-    def export_config(self, is_single = True):
-        self.llm_config['is_single'] = is_single
-        with open(f'./{self.onnx_path}/llm_config.json', 'w', encoding='utf-8') as f:
-            json.dump(self.llm_config, f, ensure_ascii=False, indent=4)
-
-    def export(self):
+    @spinner_run(f'export onnx model to ')
+    def export_onnx(self):
+        # unload linear weight to save export memory
+        self.unload_param()
         model = self
         self.seq_len = 3
         self.token_len = 0
@@ -907,15 +1213,14 @@ class LlmExporter(torch.nn.Module):
         attention_mask =  self.get_attention_mask()
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape)
-        onnx_model = f'./{self.onnx_path}/llm.onnx'
-        if self.embed_bin:
-            self.without_embed = True
+        onnx_model = f'{self.dst_path}/llm.onnx'
+        # mnn export
+        if self.withou_embedding:
             input_ids = self.embedding(input_ids)
-        print('export start ...')
+        # export to onnx
         torch.onnx.export(
             model, (input_ids, attention_mask, position_ids, past_key_values),
             onnx_model,
-            verbose=self.export_verbose,
             input_names=[
                 'input_ids', 'attention_mask', 'position_ids', 'past_key_values'
             ],
@@ -923,37 +1228,30 @@ class LlmExporter(torch.nn.Module):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
-        print('export done!')
-        if not self.skip_slim:
-            slim(onnx_model, output_model=onnx_model)
-            for file_path in glob.glob(f'./{self.onnx_path}/onnx__*'):
-                try:
-                    os.remove(file_path)
-                except FileNotFoundError:
-                    pass
-            for file_path in glob.glob(f'./{self.onnx_path}/model.*'):
-                try:
-                    os.remove(file_path)
-                except FileNotFoundError:
-                    pass
-        if self.export_test:
-            # test
-            original_outs = model(input_ids, attention_mask, position_ids, past_key_values)
-            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-            inputs = {
-                'input_ids' : input_ids.detach().numpy(),
-                'attention_mask' : attention_mask.numpy(),
-                'position_ids' : position_ids.numpy(),
-                'past_key_values' : past_key_values.numpy()
-            }
-            onnx_outs = ort_session.run(None, inputs)
-            self.assert_equal(original_outs, onnx_outs)
-        if self.export_mnn:
-            # single model is > 2G, using external_data
-            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric, True)
-        if self.without_embed:
-            self.without_embed = False
+        return onnx_model
 
+    def export(self, export_type):
+        export_mnn = export_type == 'mnn'
+        # export tokenizer
+        self.export_tokenizer()
+        if self.visual:
+            self.export_visual()
+        if export_mnn:
+            self.export_config()
+            self.export_embed()
+            self.withou_embedding = True
+        # export graph to llm.onnx
+        onnx_model = self.export_onnx()
+        if not self.skip_slim:
+            self.onnx_slim(onnx_model)
+        if export_mnn:
+            # convert onnx to mnn and quant weight
+            MNNConveter(onnx_model, self.unloaded_ops, self.quant_bit, self.quant_block).export()
+        else:
+            # export weight to llm.onnx.data
+            self.onnx_load_param(onnx_model)
+
+    @spinner_run(f'export tokenizer to ')
     def export_tokenizer(self):
         # load tokenizer file
         tokenizer_model = os.path.join(args.path, 'tokenizer.model')
@@ -986,7 +1284,7 @@ class LlmExporter(torch.nn.Module):
             fp.write(f'{len(speicals)} {len(self.stop_ids)} {len(prefix)}\n')
             write_line(fp, speicals, self.stop_ids, prefix)
 
-        file_path = os.path.join(self.onnx_path, "tokenizer.txt")
+        file_path = os.path.join(self.dst_path, "tokenizer.txt")
         special_list = list(self.tokenizer.added_tokens_decoder.keys())
         if hasattr(self.tokenizer, 'special_tokens'):
             for k, v in self.tokenizer.special_tokens.items():
@@ -999,7 +1297,6 @@ class LlmExporter(torch.nn.Module):
             prefix_list = self.tokenizer.get_prefix_tokens()
         if self.sp_model is not None:
             # senetencepiece
-            print('# senetencepiece tokenier')
             NORMAL = 1; UNKNOWN = 2; CONTROL = 3
             USER_DEFINED = 4; UNUSED = 5; BYTE = 6
             for i in range(self.sp_model.GetPieceSize()):
@@ -1027,7 +1324,6 @@ class LlmExporter(torch.nn.Module):
                 for vocab in vocab_list:
                     fp.write(vocab)
         elif hasattr(self.tokenizer, 'mergeable_ranks'):
-            print('# tiktoken tokenier')
             # tikton
             vocab_list = []
             for k, v in self.tokenizer.mergeable_ranks.items():
@@ -1068,7 +1364,6 @@ class LlmExporter(torch.nn.Module):
                 for m in merge_list:
                     fp.write(m)
         else:
-            print('# other tiktoken tokenier')
             # other tikton
             def unicode_to_byte(u: int):
                 if u >= 256 and u <= 288:
@@ -1096,18 +1391,18 @@ class LlmExporter(torch.nn.Module):
                 for v in vocab_list:
                     line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
                     fp.write(line)
+        return file_path
 
 
 class EmbeddingExporter(LlmExporter):
     def __init__(self, args):
         super().__init__(args)
-        self.attention_mask_type = 'int'
 
     def forward(self, input_ids, position_ids, attention_mask):
         input_ids = input_ids.view(1, -1)
         token_type_ids = (1 - attention_mask).view(1, -1)
         hidden_states = self.embed(input_ids, token_type_ids, position_ids)[0].unsqueeze(0)
-        for i in range(self.block_nums):
+        for i in range(self.num_hidden_layers):
             hidden_states = self.blocks[i](hidden_states, attention_mask)[0]
         sentence_embeddings = hidden_states[:, 0]
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
@@ -1124,6 +1419,7 @@ class EmbeddingExporter(LlmExporter):
         print(res)
         return res
 
+    @spinner_run(f'load pretrained model ')
     def load_model(self, model_path):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
@@ -1134,28 +1430,37 @@ class EmbeddingExporter(LlmExporter):
         self.blocks = transformer.layer
         # some wrapper
         self.stop_ids = []
-        self.block_nums = len(self.blocks)
+        self.num_hidden_layers = len(self.blocks)
         self.embed = self.embed_
         self.lm = self.lm_
-
         # some config for export
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "position_ids" : { 1: "seq_len" },
             "attention_mask" : { 3: "seq_len" }
         }
+        self.attention_mask_type = 'int'
+        self.llm_config = {
+            'hidden_size' : self.hidden_size,
+            'layer_nums' : self.num_hidden_layers,
+            'attention_mask': self.attention_mask_type,
+            'key_value_shape': [],
+            "prompt_template": self.build_prompt('%s'),
+            'is_visual': False
+        }
+        return model_path
 
-    def export(self):
+    @spinner_run(f'export onnx model to ')
+    def export_onnx(self):
         model = self.eval()
         self.seq_len = 3
         input_ids = torch.arange(3, dtype=torch.long)
         position_ids = self.get_position_ids()
         attention_mask = self.get_attention_mask()
-        onnx_model = f'./{self.onnx_path}/bge.onnx'
+        onnx_model = f'{self.dst_path}/bge.onnx'
         torch.onnx.export(
             model, (input_ids, position_ids, attention_mask),
             onnx_model,
-            verbose=self.export_verbose,
             input_names=[
                 'input_ids',
                 'position_ids',
@@ -1165,25 +1470,16 @@ class EmbeddingExporter(LlmExporter):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
+        return onnx_model
+
+    def export(self, export_type):
+        self.export_tokenizer()
+        self.export_config()
+        onnx_model = self.export_onnx()
         if not self.skip_slim:
-            slim(onnx_model, output_model=onnx_model)
-        if self.export_test:
-            self.seq_len = 4
-            position_ids = self.get_position_ids()
-            input_ids = torch.tensor([ 101,  872, 1962,  102 ], dtype=torch.long)
-            attention_mask = self.get_attention_mask()
-            # test
-            original_outs = model(input_ids, position_ids, attention_mask)
-            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
-            inputs = {
-                'input_ids' : input_ids.detach().numpy(),
-                'position_ids' : position_ids.detach().numpy(),
-                'attention_mask' : attention_mask.detach().numpy()
-            }
-            onnx_outs = ort_session.run(None, inputs)[0]
-            self.assert_equal(original_outs, onnx_outs)
-        if self.export_mnn:
-            onnx2mnn(onnx_model, self.mnn_path, 8, True)
+            self.onnx_slim(onnx_model)
+        if 'mnn' in export_type:
+            MNNConveter(onnx_model, None, self.quant_bit, self.quant_block).export()
 
     def build_prompt(self, query):
             return f'[CLS]{query}[SEP]'
@@ -1194,10 +1490,9 @@ class EmbeddingExporter(LlmExporter):
     def get_attention_mask(self) -> torch.Tensor:
         return torch.ones([1, 1, 1, self.seq_len], dtype=torch.long)
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
+    parser.add_argument('--path', type=str, required=True,
                         help='path(`str` or `os.PathLike`):\nCan be either:'
                         '\n\t- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]'
                         '\n\t- A path to a *directory* clone from repo like `../chatglm-6b`.')
@@ -1206,29 +1501,12 @@ if __name__ == '__main__':
                         '\n\tThe pretrain llm model type.'
                         )
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, defaut is `None` mean not apply lora.')
-    parser.add_argument('--onnx_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
-    parser.add_argument('--mnn_path', type=str, default='./mnn', help='export mnn model path, defaut is `./mnn`.')
-    parser.add_argument('--export_mnn', action='store_true', default=False, help='Whether or not to export mnn model after onnx.')
-    parser.add_argument('--export_verbose', action='store_true', default=False, help='Whether or not to export onnx with verbose.')
-    parser.add_argument('--export_test', action='store_true', help='Whether or not to export onnx with test using onnxruntime.')
+    parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, defaut is `./model`.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
-    parser.add_argument('--export', action='store_true', help='export model to an `onnx` model.')
-    parser.add_argument('--export_split', action='store_true',
-                        help='export model split to some `onnx` models:'
-                        '\n\t- embedding model.'
-                        '\n\t- block models.'
-                        '\n\t- lm_head model.'
-                        )
-    parser.add_argument('--export_token', action='store_true', help='export llm tokenizer to a txt file.')
-    parser.add_argument('--export_embed', action='store_true', help='export llm embedding to an `onnx` model.')
-    parser.add_argument('--export_visual', action='store_true', help='export llm visual model to an `onnx` model.')
-    parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
-    parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
-    parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
-    parser.add_argument('--embed_bin', action='store_true', help='export embedding weight as bin file with dtype `bfloat16`')
-    parser.add_argument('--embed_bf16', action='store_true', help='using `bfloat16` replace `float32` in embedding.')
+    parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
-
+    parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
+    parser.add_argument('--quant_block', type=int, default=0, help='mnn quant block, default is 0 mean channle-wise.')
 
     args = parser.parse_args()
     model_path = args.path
@@ -1243,27 +1521,5 @@ if __name__ == '__main__':
     if args.test is not None:
         llm_exporter.response(args.test)
 
-    if args.export or args.export_split:
-        if hasattr(llm_exporter, "export_config"):
-            llm_exporter.export_config(args.export)
-
-    if args.export:
-        llm_exporter.export()
-
-    if args.export_token:
-        llm_exporter.export_tokenizer()
-
-    if args.export_embed or args.export_split:
-        llm_exporter.export_embed()
-
-    if args.export_visual or args.export_split:
-        llm_exporter.export_visual()
-
-    if args.export_lm or args.export_split:
-        llm_exporter.export_lm()
-
-    if args.export_blocks or args.export_split:
-        llm_exporter.export_blocks()
-
-    if args.export_block is not None:
-        llm_exporter.export_block(args.export_block)
+    if args.export is not None:
+        llm_exporter.export(args.export)
