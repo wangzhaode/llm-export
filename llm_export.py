@@ -82,6 +82,15 @@ class ModelMapper:
 
     def regist_models(self):
         self.defualt_map()
+        # regist models
+        self.regist_llama()
+        self.regist_qwen()
+        self.regist_glm()
+        self.regist_glm2()
+        self.regist_phi()
+        self.regist_gemma2()
+
+    def regist_llama(self):
         llama_map = self.default_map
         self.regist('llama', llama_map)
         self.regist('qwen2', llama_map)
@@ -92,10 +101,6 @@ class ModelMapper:
             'o_proj': 'o_proj'
         }
         self.regist('baichuan', baichuan_map)
-        self.regist_qwen()
-        self.regist_glm()
-        self.regist_glm2()
-        self.regist_phi()
 
     def regist_qwen(self):
         qwen_map = {
@@ -203,6 +208,20 @@ class ModelMapper:
             }
         }
         self.regist('phi-msft', phi_map)
+
+    def regist_gemma2(self):
+        gemma2_config = copy.deepcopy(self.default_config)
+        gemma2_config['head_dim'] = 'head_dim'
+        gemma2_decoder = copy.deepcopy(self.default_decoder)
+        gemma2_decoder['pre_feedforward_layernorm'] = 'pre_feedforward_layernorm'
+        gemma2_decoder['post_feedforward_layernorm'] = 'post_feedforward_layernorm'
+        gemma2_map = {
+            'config': gemma2_config,
+            'model': self.defualt_model,
+            'decoder': gemma2_decoder,
+            'attention': self.default_attention
+        }
+        self.regist('gemma2', gemma2_map)
 
     def defualt_map(self):
         # default map is `LlamaForCausalLM`
@@ -356,10 +375,11 @@ class OnnxRebuilder:
         return self.onnx_weight_path
 
 class MNNConveter:
-    def __init__(self, onnx_path, weight_ops, quant_bit = 4,quant_block = 0):
+    def __init__(self, onnx_path, weight_ops, config):
         self.weight_ops = weight_ops
-        self.quant_block = quant_block
-        self.quant_bit = quant_bit
+        self.quant_block = config.quant_block
+        self.quant_bit = config.quant_bit
+        self.lm_quant_bit = config.lm_quant_bit
         self.mnn_weight_offset = 0
         self.onnx_model_path = onnx_path
         self.mnn_model_path = onnx_path.replace('.onnx', '.mnn')
@@ -458,25 +478,25 @@ class MNNConveter:
             json.dump(mnn_graph, file, ensure_ascii=False, indent=4)
         return self.mnn_weight_path
 
-    def quant(self, weight):
+    def quant(self, weight, quant_bit, quant_block):
         weight = weight.numpy()
         oc, ic = weight.shape
-        if self.quant_block == 0:
+        if quant_block == 0:
             block_size = ic
         else:
-            block_size = self.quant_block
+            block_size = quant_block
         block_num = ic // block_size
         weight = weight.reshape(oc, block_num, block_size)
         max_val = np.max(weight, axis=-1, keepdims=True)
         min_val = np.min(weight, axis=-1, keepdims=True)
-        offset = 1 << (self.quant_bit - 1)
+        offset = 1 << (quant_bit - 1)
         clip_max = offset - 1
         clip_min = -offset
         scale = (max_val - min_val) / (clip_max - clip_min)
         q_weight = np.round((weight - min_val) / scale).astype(np.int8) + clip_min
         q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
         q_weight = q_weight.reshape(-1, 2)
-        if self.quant_bit == 4:
+        if quant_bit == 4:
             q_weight = q_weight[:, 0] * 16 + q_weight[:, 1]
         alpha = np.stack([min_val.flatten(), scale.flatten()], axis=-1).flatten()
         return q_weight, alpha, clip_min
@@ -484,23 +504,23 @@ class MNNConveter:
     def write_npy(self, data):
         return self.mnn_weight.write(data.tobytes())
 
-    def write_header(self, ic, oc):
+    def write_header(self, ic, oc, quant_bit):
         dim_num = self.mnn_weight.write(b'\x02')
         shape_dtype = np.int16
         if oc > 65535 or ic > 65535:
             shape_dtype = np.int32
         dim_length = self.write_npy(np.array([oc, ic]).astype(shape_dtype))
-        offset = 1 << (self.quant_bit - 1)
+        offset = 1 << (quant_bit - 1)
         weight_map = [i for i in range(-offset, offset)]
         weight_map.insert(0, len(weight_map))
         map_length = self.write_npy(np.array(weight_map, dtype=np.int8))
         header_length = dim_num + dim_length + map_length
         return header_length, shape_dtype == np.int32
 
-    def build_weight(self, linear):
+    def build_weight(self, linear, quant_bit, quant_block):
         ic, oc = linear.in_features, linear.out_features
-        q_weight, alpha, q_min = self.quant(linear.weight.data)
-        header_len, shape_int32 = self.write_header(ic, oc)
+        q_weight, alpha, q_min = self.quant(linear.weight.data, quant_bit, quant_block)
+        header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
         weight_len = self.write_npy(q_weight) + header_len
         alpha_len = self.write_npy(alpha)
         if linear.bias is not None:
@@ -535,7 +555,10 @@ class MNNConveter:
                linear.out_features == oc and
                (linear.bias is not None) == has_bias)
 
-        external, q_min, shape_int32 = self.build_weight(linear)
+
+        quant_bit = self.lm_quant_bit if 'lm_head' in name else self.quant_bit
+        print(f'quant layer {name}: bits {quant_bit}, block {self.quant_block}')
+        external, q_min, shape_int32 = self.build_weight(linear, quant_bit, self.quant_block)
 
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
@@ -630,9 +653,13 @@ class Embedding(torch.nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.embed = embed
+        if config.model_type == 'gemma2':
+            normalizer = torch.tensor(self.hidden_size**0.5)
+            self.embed.weight.data *= normalizer
 
     def forward(self, input_ids):
-        return self.embed(input_ids).view(-1, 1, self.hidden_size)
+        inputs_embeds = self.embed(input_ids).view(-1, 1, self.hidden_size)
+        return inputs_embeds
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
@@ -695,6 +722,7 @@ class Attention(torch.nn.Module):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        # print(f'hidden_states.shape = {hidden_states.shape}, query_states.shape = {query_states.shape}')
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
@@ -734,7 +762,7 @@ class Attention(torch.nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, past_key_value
 
@@ -832,22 +860,32 @@ class Decoder(torch.nn.Module):
             past_key_value=past_key_value,
         )
         # Fully Connected
-        if self.alpha != 1.0:
+        if not hasattr(self, 'post_attention_layernorm'):
+            # phi
+            feed_forward_hidden_states = self.mlp(norm_hidden_states)
+            hidden_states = hidden_states + feed_forward_hidden_states + residual
+        elif self.alpha != 1.0:
             # chatglm-6b
             hidden_states = norm_hidden_states * self.alpha + hidden_states
             mlp_input = self.post_attention_layernorm(hidden_states)
             mlp_output = self.mlp(mlp_input)
             hidden_states = mlp_input * self.alpha + mlp_output
-        elif hasattr(self, 'post_attention_layernorm'):
+        elif hasattr(self, 'pre_feedforward_layernorm'):
+            # gemma2
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            # general
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
-        else:
-            # phi
-            feed_forward_hidden_states = self.mlp(norm_hidden_states)
-            hidden_states = hidden_states + feed_forward_hidden_states + residual
 
         return hidden_states, present_key_value
 
@@ -886,6 +924,10 @@ class LlmExporter(torch.nn.Module):
         self.skip_slim = args.skip_slim
         self.quant_bit = args.quant_bit
         self.quant_block = args.quant_block
+        if args.lm_quant_bit is not None:
+            self.lm_quant_bit = args.lm_quant_bit
+        else:
+            self.lm_quant_bit = self.quant_bit
         # init export dst dir
         if not os.path.exists(self.dst_path):
             os.makedirs(self.dst_path)
@@ -920,6 +962,7 @@ class LlmExporter(torch.nn.Module):
                     self.stop_ids.append(id)
         self.stop_ids = [stop_id for stop_id in self.stop_ids if stop_id is not None]
         model_mapper = ModelMapper()
+
         self.model_type, self.model_map = model_mapper.get_map(self.config)
         # print(self.model)
         # print(self.model_type, self.model_map)
@@ -929,7 +972,8 @@ class LlmExporter(torch.nn.Module):
             self.num_key_value_heads = self.num_attention_heads
         if not hasattr(self, 'rope_theta') or self.rope_theta is None:
             self.rope_theta = 10000.0
-        self.head_dim = self.hidden_size // self.num_attention_heads
+        if not hasattr(self, 'head_dim') or self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
         # some export info
         self.past_kv_shape = [self.num_hidden_layers, 2, 1, 0, self.num_key_value_heads, self.head_dim]
         self.block_dynamic_axes = {
@@ -1082,6 +1126,8 @@ class LlmExporter(torch.nn.Module):
             return f'{query}[gMASK]<sop>'
         if 'phi-2' in self.model_name:
             return f'Instruct: {query}\nOutput:'
+        if 'gemma-2' in self.model_name:
+            return f'<bos><start_of_turn>user\n{query}<end_of_turn>\n<start_of_turn>model\n'
         return query
 
     def str_to_ids(self, prompt):
@@ -1246,7 +1292,7 @@ class LlmExporter(torch.nn.Module):
             self.onnx_slim(onnx_model)
         if export_mnn:
             # convert onnx to mnn and quant weight
-            MNNConveter(onnx_model, self.unloaded_ops, self.quant_bit, self.quant_block).export()
+            MNNConveter(onnx_model, self.unloaded_ops, self).export()
         else:
             # export weight to llm.onnx.data
             self.onnx_load_param(onnx_model)
@@ -1479,7 +1525,7 @@ class EmbeddingExporter(LlmExporter):
         if not self.skip_slim:
             self.onnx_slim(onnx_model)
         if 'mnn' in export_type:
-            MNNConveter(onnx_model, None, self.quant_bit, self.quant_block).export()
+            MNNConveter(onnx_model, None, self).export()
 
     def build_prompt(self, query):
             return f'[CLS]{query}[SEP]'
@@ -1506,7 +1552,8 @@ if __name__ == '__main__':
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
-    parser.add_argument('--quant_block', type=int, default=0, help='mnn quant block, default is 0 mean channle-wise.')
+    parser.add_argument('--quant_block', type=int, default=128, help='mnn quant block, default is 0 mean channle-wise.')
+    parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head quant bit, 4 or 8, default is `quant_bit`.')
 
     args = parser.parse_args()
     model_path = args.path
