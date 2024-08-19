@@ -9,27 +9,33 @@ llm-export is a tool for exporting llm models, capable of converting llm models 
 - 🚀 Support export lora weight to onnx or MNN model
 - 🚀 Onnx inference code [OnnxLLM](https://github.com/inisis/OnnxLLM)
 
-## Model Support and Downloads
+## Install
+
+```sh
+# pip install
+pip install llm_export
+
+# git install
+pip install git+https://github.com/wangzhaode/llm-export@master
+
+# local install
+git clone clnoe https://github.com/wangzhaode/llm-export && cd llm-export/
+pip install .
+```
 
 ## Usage
-1. Clone this project locally
-```sh
-git clnoe git@github.com:wangzhaode/llm-export.git
-```
-2. Clone the LLM project that you want to export locally, such as: chatglm2-6b
+1. Clone the LLM project that you want to export locally, such as: chatglm2-6b
 ```sh
 git clone https://huggingface.co/THUDM/chatglm2-6b
 # If downloading from Hugging Face is slow, you can use ModelScope
 git clone https://modelscope.cn/ZhipuAI/chatglm2-6b.git
 ```
-3. export the model
+2. export the model
 ```sh
-cd mnn-llm
-cd mnn-llm
 # export chatglm2-6b to onnx
-python llm_export.py --path ../chatglm2-6b --export onnx
+llm_export --path ../chatglm2-6b --export onnx
 # export chatglm2-6b to mnn and quant
-python llm_export.py --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
+llm_export --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 ```
 
 ## Features
@@ -40,6 +46,7 @@ python llm_export.py --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_bl
 ## Commad Args
 ```
 usage: llm_export.py [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
+                     [--lm_quant_bit LM_QUANT_BIT]
 
 llm_exporter
 
@@ -61,4 +68,14 @@ optional arguments:
                         mnn quant bit, 4 or 8, default is 4.
   --quant_block QUANT_BLOCK
                         mnn quant block, default is 0 mean channle-wise.
+  --lm_quant_bit LM_QUANT_BIT
+                        mnn lm_head quant bit, 4 or 8, default is `quant_bit`.
 ```
+
+## Support models
+
+- llama/llama2/llama3/tinyllama
+- qwen/qwen1.5/qwen2/qwen-vl
+- baichuan2/phi-2/internlm/yi/deepseek
+- chatglm/codegeex/chatglm2/chatglm3
+- phi-2/gemma-2

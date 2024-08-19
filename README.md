@@ -10,24 +10,33 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 - 🚀 支持将lora权重导出为onnx和mnn
 - 🚀 Onnx推理代码[OnnxLLM](https://github.com/inisis/OnnxLLM)
 
-## 用法
-1. 将该项目clone到本地
+## 安装
 ```sh
-git clone git@github.com:wangzhaode/llm-export.git
+# pip install
+pip install llm_export
+
+# git install
+pip install git+https://github.com/wangzhaode/llm-export@master
+
+# local install
+git clone clnoe https://github.com/wangzhaode/llm-export && cd llm-export/
+pip install .
 ```
-2. 将需要导出的LLM项目clone到本地，如：chatglm2-6b
+
+## 用法
+
+1. 将需要导出的LLM项目clone到本地，如：chatglm2-6b
 ```sh
 git clone https://huggingface.co/THUDM/chatglm2-6b
 # 如果huggingface下载慢可以使用modelscope
 git clone https://modelscope.cn/ZhipuAI/chatglm2-6b.git
 ```
-3. 导出模型
+2. 导出模型
 ```sh
-cd mnn-llm
 # 将chatglm2-6b导出为onnx模型
-python llm_export.py --path ../chatglm2-6b --export onnx
+llm_export --path ../chatglm2-6b --export onnx
 # 将chatglm2-6b导出为mnn模型, 量化参数为4bit, blokc-wise = 128
-python llm_export.py --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
+llm_export --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 ```
 
 ## 功能
@@ -39,6 +48,7 @@ python llm_export.py --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_bl
 ## 参数
 ```
 usage: llm_export.py [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
+                     [--lm_quant_bit LM_QUANT_BIT]
 
 llm_exporter
 
@@ -60,4 +70,14 @@ optional arguments:
                         mnn quant bit, 4 or 8, default is 4.
   --quant_block QUANT_BLOCK
                         mnn quant block, default is 0 mean channle-wise.
+  --lm_quant_bit LM_QUANT_BIT
+                        mnn lm_head quant bit, 4 or 8, default is `quant_bit`.
 ```
+
+## 支持模型
+
+- llama/llama2/llama3/tinyllama
+- qwen/qwen1.5/qwen2/qwen-vl
+- baichuan2/phi-2/internlm/yi/deepseek
+- chatglm/codegeex/chatglm2/chatglm3
+- phi-2/gemma-2

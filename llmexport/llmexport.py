@@ -2,7 +2,6 @@ import os
 import sys
 import math
 import copy
-import glob
 import json
 import time
 import base64
@@ -14,23 +13,15 @@ from typing import Optional, Tuple
 
 from yaspin import yaspin
 
+import onnx
 import torch
 import numpy as np
-# transformers
-import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-# export to onnx
-import onnx
-from onnx import helper
-from onnxslim import slim
-from torch.onnx.symbolic_helper import _get_tensor_sizes
-# export to mnn
-from MNN.tools import mnnconvert
 
 RESET = "\033[0m"
 GREEN = "\033[32;1m"
 YELLOW = "\033[33;4m"
-EXPORT_LOG = 'export.log'
+EXPORT_LOG = '.export.log'
 
 # ignore warnning info
 warnings.filterwarnings("ignore")
@@ -287,6 +278,7 @@ class LlmExporterOp(torch.autograd.Function):
             "has_bias_i": has_bias,
             "name_s": name
         }
+        from torch.onnx.symbolic_helper import _get_tensor_sizes
         out_sizes = _get_tensor_sizes(input)[:-1] + [out_features]
         output_type = input.type().with_sizes(out_sizes)
         return g.op("LlmExporter::FakeLinear", input, **kwargs).setType(output_type)
@@ -312,7 +304,7 @@ class OnnxRebuilder:
         self.weight_ops = weight_ops
         self.onnx_model = onnx.load(onnx_path)
         self.dst_path = onnx_path
-        self.onnx_weight_path = f'{os.path.basename(onnx_path)}.data'
+        self.onnx_weight_path = f'{onnx_path}.data'
         self.onnx_weight_offset = 0
 
     def make_external(self, name, data, shape):
@@ -348,6 +340,7 @@ class OnnxRebuilder:
         return weight_name, bias_name
 
     def rebuild(self):
+        from onnx import helper
         new_nodes = []
         self.onnx_weight = open(self.onnx_weight_path, 'wb')
         for node in self.onnx_model.graph.node:
@@ -395,6 +388,7 @@ class MNNConveter:
         try:
             sys.argv = convert_args
             sys.argc = len(convert_args)
+            from MNN.tools import mnnconvert
             mnnconvert.main()
             sys.argv = []
         finally:
@@ -557,7 +551,6 @@ class MNNConveter:
 
 
         quant_bit = self.lm_quant_bit if 'lm_head' in name else self.quant_bit
-        print(f'quant layer {name}: bits {quant_bit}, block {self.quant_block}')
         external, q_min, shape_int32 = self.build_weight(linear, quant_bit, self.quant_block)
 
         origin_input = op['inputIndexes']
@@ -918,7 +911,7 @@ class LlmExporter(torch.nn.Module):
         self.visual = None
         self.withou_embedding = False
         # load config from args
-        self.model_name = args.path
+        self.path = args.path
         self.dst_path = args.dst_path
         self.lora_path = args.lora_path
         self.skip_slim = args.skip_slim
@@ -1100,33 +1093,33 @@ class LlmExporter(torch.nn.Module):
     # some test functions
     def build_prompt(self, query):
         # just for test
-        if 'Qwen2' in self.model_name:
+        if 'Qwen2' in self.path:
             return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
-        if 'Qwen' in self.model_name:
+        if 'Qwen' in self.path:
             return f'\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
-        if 'Baichuan2' in self.model_name:
+        if 'Baichuan2' in self.path:
             return f'<reserved_106>{query}<reserved_107>'
-        if 'internlm' in self.model_name:
+        if 'internlm' in self.path:
             return f'<|User|>:{query}<eoh>\n<|Bot|>:'
-        if 'TinyLlama' in self.model_name:
+        if 'TinyLlama' in self.path:
             return f'<s><|system|>\nYou are a friendly chatbot who always responds in the style of a pirate</s>\n<|user|>\n{query}</s>\n<|assistant|>\n'
-        if 'Yi' in self.model_name:
+        if 'Yi' in self.path:
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
-        if 'deepseek' in self.model_name:
+        if 'deepseek' in self.path:
             return f'<|begin_of_sentence|>User: {query}\n\nAssistant:'
-        if 'Llama-3' in self.model_name:
+        if 'Llama-3' in self.path:
             return f'<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
-        if 'Llama-2' in self.model_name:
+        if 'Llama-2' in self.path:
             return f'<s>[INST]{query}[/INST]'
-        if 'chatglm2' in self.model_name:
+        if 'chatglm2' in self.path:
             return f'[Round 1]\n\n问：{query}\n\n答：'
-        if 'chatglm3' in self.model_name or 'glm-4' in self.model_name:
+        if 'chatglm3' in self.path or 'glm-4' in self.path:
             return f'<|user|>\n{query}\n<|assistant|>\n'
-        if 'chatglm' in self.model_name:
+        if 'chatglm' in self.path:
             return f'{query}[gMASK]<sop>'
-        if 'phi-2' in self.model_name:
+        if 'phi-2' in self.path:
             return f'Instruct: {query}\nOutput:'
-        if 'gemma-2' in self.model_name:
+        if 'gemma-2' in self.path:
             return f'<bos><start_of_turn>user\n{query}<end_of_turn>\n<start_of_turn>model\n'
         return query
 
@@ -1241,11 +1234,9 @@ class LlmExporter(torch.nn.Module):
 
     @spinner_run(f'slim the graph of ')
     def onnx_slim(self, onnx_model):
-        stdout = sys.stdout
-        with open(EXPORT_LOG, 'a') as f:
-            sys.stdout = f
-            slim(onnx_model, output_model=onnx_model)
-        sys.stdout = stdout
+        import onnxslim
+        model = onnxslim.slim(onnx_model)
+        onnx.save(model, onnx_model)
         return onnx_model
 
     @spinner_run(f'export onnx model to ')
@@ -1300,9 +1291,10 @@ class LlmExporter(torch.nn.Module):
     @spinner_run(f'export tokenizer to ')
     def export_tokenizer(self):
         # load tokenizer file
-        tokenizer_model = os.path.join(args.path, 'tokenizer.model')
-        ice_text_model = os.path.join(args.path, 'ice_text.model')
+        tokenizer_model = os.path.join(self.path, 'tokenizer.model')
+        ice_text_model = os.path.join(self.path, 'ice_text.model')
         try:
+            import sentencepiece as spm
             if os.path.exists(tokenizer_model):
                 self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
             elif os.path.exists(ice_text_model):
@@ -1311,7 +1303,7 @@ class LlmExporter(torch.nn.Module):
                 self.sp_model = None
         except:
             self.sp_model = None
-        merge_file = os.path.join(args.path, 'merges.txt')
+        merge_file = os.path.join(self.path, 'merges.txt')
         if os.path.exists(merge_file):
             self.merge_txt = merge_file
         else:
@@ -1357,7 +1349,7 @@ class LlmExporter(torch.nn.Module):
                     type = UNUSED
                 elif self.sp_model.IsByte(i):
                     type = BYTE
-                if self.model_name == 'Chatglm_6b':
+                if self.path == 'Chatglm_6b':
                     if '<n>' in token: token = '\n'
                     if '<|tab|>' in token: token = '\t'
                     if '<|blank_' in token: token = ' ' * int(token[8:token.find('|>')])
@@ -1536,7 +1528,36 @@ class EmbeddingExporter(LlmExporter):
     def get_attention_mask(self) -> torch.Tensor:
         return torch.ones([1, 1, 1, self.seq_len], dtype=torch.long)
 
-if __name__ == '__main__':
+def export(path,
+           type = None,
+           lora_path = None,
+           dst_path = './model',
+           export = 'onnx',
+           skip_slim = False,
+           quant_bit = 4,
+           quant_block = 128,
+           lm_quant_bit = None):
+    args = argparse.Namespace()
+    for k, v in {
+        'path': path,
+        'type': type,
+        'lora_path': lora_path,
+        'dst_path': dst_path,
+        'export': export,
+        'skip_slim': skip_slim,
+        'quant_bit': quant_bit,
+        'quant_block': quant_block,
+        'lm_quant_bit': lm_quant_bit
+    }.items():
+        setattr(args, k, v)
+    if 'bge' in path:
+        llm_exporter = EmbeddingExporter(args)
+    else:
+        llm_exporter = LlmExporter(args)
+    # export
+    llm_exporter.export(export)
+
+def main():
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, required=True,
                         help='path(`str` or `os.PathLike`):\nCan be either:'
@@ -1556,6 +1577,7 @@ if __name__ == '__main__':
     parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head quant bit, 4 or 8, default is `quant_bit`.')
 
     args = parser.parse_args()
+
     model_path = args.path
     model_type = args.type
 
@@ -1570,3 +1592,6 @@ if __name__ == '__main__':
 
     if args.export is not None:
         llm_exporter.export(args.export)
+
+if __name__ == '__main__':
+    main()
