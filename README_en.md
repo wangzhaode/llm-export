@@ -13,13 +13,13 @@ llm-export is a tool for exporting llm models, capable of converting llm models 
 
 ```sh
 # pip install
-pip install llm_export
+pip install llmexport
 
 # git install
 pip install git+https://github.com/wangzhaode/llm-export@master
 
 # local install
-git clone clnoe https://github.com/wangzhaode/llm-export && cd llm-export/
+git clone https://github.com/wangzhaode/llm-export && cd llm-export/
 pip install .
 ```
 
@@ -33,9 +33,9 @@ git clone https://modelscope.cn/ZhipuAI/chatglm2-6b.git
 2. export the model
 ```sh
 # export chatglm2-6b to onnx
-llm_export --path ../chatglm2-6b --export onnx
+llmexport --path ../chatglm2-6b --export onnx
 # export chatglm2-6b to mnn and quant
-llm_export --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
+llmexport --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 ```
 
 ## Features
@@ -45,8 +45,8 @@ llm_export --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 
 ## Commad Args
 ```
-usage: llm_export.py [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
-                     [--lm_quant_bit LM_QUANT_BIT]
+usage: llmexport [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
+                 [--lm_quant_bit LM_QUANT_BIT]
 
 llm_exporter
 

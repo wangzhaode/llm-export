@@ -13,13 +13,13 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 ## 安装
 ```sh
 # pip install
-pip install llm_export
+pip install llmexport
 
 # git install
 pip install git+https://github.com/wangzhaode/llm-export@master
 
 # local install
-git clone clnoe https://github.com/wangzhaode/llm-export && cd llm-export/
+git clone https://github.com/wangzhaode/llm-export && cd llm-export/
 pip install .
 ```
 
@@ -34,9 +34,9 @@ git clone https://modelscope.cn/ZhipuAI/chatglm2-6b.git
 2. 导出模型
 ```sh
 # 将chatglm2-6b导出为onnx模型
-llm_export --path ../chatglm2-6b --export onnx
+llmexport --path ../chatglm2-6b --export onnx
 # 将chatglm2-6b导出为mnn模型, 量化参数为4bit, blokc-wise = 128
-llm_export --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
+llmexport --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 ```
 
 ## 功能
@@ -47,8 +47,8 @@ llm_export --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 
 ## 参数
 ```
-usage: llm_export.py [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
-                     [--lm_quant_bit LM_QUANT_BIT]
+usage: llmexport [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
+                 [--lm_quant_bit LM_QUANT_BIT]
 
 llm_exporter
 
