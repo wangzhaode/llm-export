@@ -1185,10 +1185,12 @@ class LlmExporter(torch.nn.Module):
         return embedding_file
 
     @spinner_run(f'export config to ')
-    def export_config(self):
+    def export_config(self, mnn_config = False):
         config_json = f'{self.dst_path}/llm_config.json'
         with open(config_json, 'w', encoding='utf-8') as f:
             json.dump(self.llm_config, f, ensure_ascii=False, indent=4)
+        if not mnn_config:
+            return config_json
         with open(f'{self.dst_path}/config.json', 'w', encoding='utf-8') as f:
             config = {
                 "llm_model": "llm.mnn",
@@ -1221,16 +1223,6 @@ class LlmExporter(torch.nn.Module):
     @spinner_run(f'export model weight to ')
     def onnx_load_param(self, onnx_path):
         return OnnxRebuilder(onnx_path, self.unloaded_ops).rebuild()
-
-    def onnx_export(self, model, onnx_model, inputs, input_names, output_names, dynamic_axes):
-        torch.onnx.export(
-            model, inputs,
-            onnx_model,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            do_constant_folding=True,
-            opset_version=15)
 
     @spinner_run(f'slim the graph of ')
     def onnx_slim(self, onnx_model):
@@ -1271,10 +1263,10 @@ class LlmExporter(torch.nn.Module):
         export_mnn = export_type == 'mnn'
         # export tokenizer
         self.export_tokenizer()
+        self.export_config(export_mnn)
         if self.visual:
             self.export_visual()
         if export_mnn:
-            self.export_config()
             self.export_embed()
             self.withou_embedding = True
         # export graph to llm.onnx
