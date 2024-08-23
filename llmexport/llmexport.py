@@ -1142,8 +1142,10 @@ class LlmExporter(torch.nn.Module):
         return word
 
     def response(self, query):
+        self.imitate_quant()
         prompt = self.build_prompt(query)
         input_ids = self.str_to_ids(prompt)
+        # print(f'prompt = {prompt}, ids = {input_ids}')
         self.seq_len = input_ids.numel()
         self.context_len = self.seq_len - 2
         self.token_len = 0
@@ -1212,6 +1214,61 @@ class LlmExporter(torch.nn.Module):
             }
             json.dump(config, f, ensure_ascii=False, indent=4)
         return config_json
+
+    def quant(self, weight, quant_bit, quant_block):
+        weight = weight.numpy()
+        oc, ic = weight.shape
+        if quant_block == 0:
+            block_size = ic
+        else:
+            block_size = quant_block
+        block_num = ic // block_size
+        weight = weight.reshape(oc, block_num, block_size)
+        max_val = np.max(weight, axis=-1, keepdims=True)
+        min_val = np.min(weight, axis=-1, keepdims=True)
+        offset = 1 << (quant_bit - 1)
+        clip_max = offset - 1
+        clip_min = -offset
+        scale = (max_val - min_val) / (clip_max - clip_min)
+        q_weight = np.round((weight - min_val) / scale) + clip_min
+        q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
+        q_weight = q_weight.reshape(-1, 2)
+        if quant_bit == 4:
+            q_weight = q_weight[:, 0] * 16 + q_weight[:, 1]
+        alpha = np.stack([min_val.flatten(), scale.flatten()], axis=-1).flatten()
+        return q_weight, alpha, clip_min
+
+    def imitate_quant(self):
+        def quant_dequant(linear, quant_bit = self.quant_bit, quant_block = self.quant_block):
+            weight = linear.weight.data
+            oc, ic = weight.shape
+            if quant_block == 0:
+                block_size = ic
+            else:
+                block_size = quant_block
+            block_num = ic // block_size
+            weight = weight.reshape(oc, block_num, block_size)
+            max_val = torch.max(weight, axis=-1, keepdims=True).values
+            min_val = torch.min(weight, axis=-1, keepdims=True).values
+            offset = 1 << (quant_bit - 1)
+            clip_max = offset - 1
+            clip_min = -offset
+            scale = (max_val - min_val) / (clip_max - clip_min)
+            q_weight = torch.round((weight - min_val) / scale) + clip_min
+            q_weight = torch.clip(q_weight, clip_min, clip_max)
+            dq_weight = (q_weight - clip_min) * scale + min_val
+            dq_weight = dq_weight.reshape(oc, ic).float()
+            linear.weight.data = dq_weight
+            return linear
+        with torch.no_grad():
+            for i in range(self.num_hidden_layers):
+                for name, child in self.blocks[i].self_attn.named_children():
+                    if isinstance(child, torch.nn.Linear):
+                        setattr(self.blocks[i].self_attn, name, quant_dequant(child))
+                for name, child in self.blocks[i].mlp.named_children():
+                    if isinstance(child, torch.nn.Linear):
+                        setattr(self.blocks[i].mlp, name, quant_dequant(child))
+            self.lm.lm = quant_dequant(self.lm.lm)
 
     def unload_param(self):
         self.unloaded_ops = {}
