@@ -487,7 +487,7 @@ class MNNConveter:
         clip_max = offset - 1
         clip_min = -offset
         scale = (max_val - min_val) / (clip_max - clip_min)
-        q_weight = np.round((weight - min_val) / scale).astype(np.int8) + clip_min
+        q_weight = np.round((weight - min_val) / scale) + clip_min
         q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
         q_weight = q_weight.reshape(-1, 2)
         if quant_bit == 4:
@@ -506,7 +506,10 @@ class MNNConveter:
         dim_length = self.write_npy(np.array([oc, ic]).astype(shape_dtype))
         offset = 1 << (quant_bit - 1)
         weight_map = [i for i in range(-offset, offset)]
-        weight_map.insert(0, len(weight_map))
+        if len(weight_map) == 256:
+            weight_map.insert(0, 0)
+        else:
+            weight_map.insert(0, len(weight_map))
         map_length = self.write_npy(np.array(weight_map, dtype=np.int8))
         header_length = dim_num + dim_length + map_length
         return header_length, shape_dtype == np.int32
@@ -715,7 +718,6 @@ class Attention(torch.nn.Module):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-        # print(f'hidden_states.shape = {hidden_states.shape}, query_states.shape = {query_states.shape}')
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
@@ -910,6 +912,7 @@ class LlmExporter(torch.nn.Module):
         self.stop_ids = []
         self.visual = None
         self.withou_embedding = False
+        self.dst_name = 'llm'
         # load config from args
         self.path = args.path
         self.dst_path = args.dst_path
@@ -945,6 +948,9 @@ class LlmExporter(torch.nn.Module):
         self.stop_ids.append(self.tokenizer.eos_token_id)
         if hasattr(self.tokenizer, 'im_end_id'):
             self.stop_ids.append(self.tokenizer.im_end_id)
+        eot_id = self.tokenizer.encode('<|eot_id|>')
+        if len(eot_id) == 1:
+            self.stop_ids.append(eot_id[0])
         if hasattr(self.model, 'generation_config'):
             eos_token_id = self.model.generation_config.eos_token_id
             from collections.abc import Iterable
@@ -954,6 +960,7 @@ class LlmExporter(torch.nn.Module):
                 for id in eos_token_id:
                     self.stop_ids.append(id)
         self.stop_ids = [stop_id for stop_id in self.stop_ids if stop_id is not None]
+        self.stop_ids = list(set(self.stop_ids))
         model_mapper = ModelMapper()
 
         self.model_type, self.model_map = model_mapper.get_map(self.config)
@@ -1107,10 +1114,12 @@ class LlmExporter(torch.nn.Module):
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
         if 'deepseek' in self.path:
             return f'<|begin_of_sentence|>User: {query}\n\nAssistant:'
+        if 'Llama-3.1' in self.path:
+            return f'<|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
         if 'Llama-3' in self.path:
             return f'<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
         if 'Llama-2' in self.path:
-            return f'<s>[INST]{query}[/INST]'
+            return f'[INST]{query}[/INST]'
         if 'chatglm2' in self.path:
             return f'[Round 1]\n\n问：{query}\n\n答：'
         if 'chatglm3' in self.path or 'glm-4' in self.path:
@@ -1145,7 +1154,6 @@ class LlmExporter(torch.nn.Module):
             position_ids = self.get_position_ids()
             logits, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
             token_id = torch.argmax(logits)
-            # print(token_id)
             if token_id in self.stop_ids:
                 print("", end='\n')
                 break
@@ -1173,10 +1181,12 @@ class LlmExporter(torch.nn.Module):
 
     @spinner_run(f'export embedding to ')
     def export_embed(self):
-        if not hasattr(self, 'embed') or not isinstance(self.embed.embed, torch.nn.Embedding):
-            return
         import ctypes
-        tensor_data = self.embed.embed.weight.data.bfloat16()
+        if hasattr(self, 'word_embeddings'):
+            # embedding model's embed
+            tensor_data = self.word_embeddings.weight.data.bfloat16()
+        else:
+            tensor_data = self.embed.embed.weight.data.bfloat16()
         data_ptr = tensor_data.untyped_storage().data_ptr()
         buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
         embedding_file = f'{self.dst_path}/embeddings_bf16.bin'
@@ -1193,8 +1203,8 @@ class LlmExporter(torch.nn.Module):
             return config_json
         with open(f'{self.dst_path}/config.json', 'w', encoding='utf-8') as f:
             config = {
-                "llm_model": "llm.mnn",
-                "llm_weight": "llm.mnn.weight",
+                "llm_model": f"{self.dst_name}.mnn",
+                "llm_weight": f"{self.dst_name}.mnn.weight",
                 "backend_type": "cpu",
                 "thread_num": 4,
                 "precision": "low",
@@ -1242,7 +1252,7 @@ class LlmExporter(torch.nn.Module):
         attention_mask =  self.get_attention_mask()
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape)
-        onnx_model = f'{self.dst_path}/llm.onnx'
+        onnx_model = f'{self.dst_path}/{self.dst_name}.onnx'
         # mnn export
         if self.withou_embedding:
             input_ids = self.embedding(input_ids)
@@ -1332,22 +1342,22 @@ class LlmExporter(torch.nn.Module):
             for i in range(self.sp_model.GetPieceSize()):
                 token = self.sp_model.IdToPiece(i)
                 score = self.sp_model.GetScore(i)
-                type = NORMAL
+                token_type = NORMAL
                 if self.sp_model.IsUnknown(i):
-                    type = UNKNOWN
+                    token_type = UNKNOWN
                 elif self.sp_model.IsControl(i):
-                    type = CONTROL
+                    token_type = CONTROL
                 elif self.sp_model.IsUnused(i):
-                    type = UNUSED
+                    token_type = UNUSED
                 elif self.sp_model.IsByte(i):
-                    type = BYTE
+                    token_type = BYTE
                 if self.path == 'Chatglm_6b':
                     if '<n>' in token: token = '\n'
                     if '<|tab|>' in token: token = '\t'
                     if '<|blank_' in token: token = ' ' * int(token[8:token.find('|>')])
                 if '▁' in token: token = token.replace('▁', ' ')
                 token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
-                vocab_list.append(f'{token_encode} {score} {type}\n')
+                vocab_list.append(f'{token_encode} {score} {token_type}\n')
             with open(file_path, "w", encoding="utf8") as fp:
                 write_header(fp, SENTENCEPIECE, special_list, prefix_list)
                 fp.write(f'{len(vocab_list)}\n')
@@ -1394,7 +1404,12 @@ class LlmExporter(torch.nn.Module):
                 for m in merge_list:
                     fp.write(m)
         else:
-            # other tikton
+            # tiktoken or bert
+            if 'bert' in type(self.tokenizer).__name__.lower():
+                tokenizer_type = BERT
+            else:
+                tokenizer_type = TIKTOIKEN
+            # bert tokenizer
             def unicode_to_byte(u: int):
                 if u >= 256 and u <= 288:
                     return u - 256
@@ -1416,7 +1431,7 @@ class LlmExporter(torch.nn.Module):
                     vocab_list[int(v)] = k
             special_list = list(self.tokenizer.added_tokens_decoder.keys())
             with open(file_path, "w", encoding="utf8") as fp:
-                write_header(fp, TIKTOIKEN, special_list)
+                write_header(fp, tokenizer_type, special_list)
                 fp.write(f'{len(vocab_list)}\n')
                 for v in vocab_list:
                     line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
@@ -1427,16 +1442,43 @@ class LlmExporter(torch.nn.Module):
 class EmbeddingExporter(LlmExporter):
     def __init__(self, args):
         super().__init__(args)
+        self.dst_name = 'embedding'
 
-    def forward(self, input_ids, position_ids, attention_mask):
-        input_ids = input_ids.view(1, -1)
-        token_type_ids = (1 - attention_mask).view(1, -1)
-        hidden_states = self.embed(input_ids, token_type_ids, position_ids)[0].unsqueeze(0)
+    def word_embed(self, input_ids):
+        return self.word_embeddings(input_ids.view(1, -1))
+
+    def bge_forward(self, inputs_embeds, position_ids, attention_mask):
+        # bert absolute position
+        inputs_embeds = inputs_embeds.reshape(1, -1, self.hidden_size)
+        position_embeddings = self.position_embeddings(position_ids)
+        embeddings = inputs_embeds + position_embeddings + self.token_type_embeddings
+        hidden_states = self.embedding_layernorm(embeddings)
         for i in range(self.num_hidden_layers):
             hidden_states = self.blocks[i](hidden_states, attention_mask)[0]
         sentence_embeddings = hidden_states[:, 0]
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings
+
+    def gte_forward(self, inputs_embeds, position_ids, attention_mask):
+        # rope position
+        inputs_embeds = inputs_embeds.reshape(1, -1, self.hidden_size)
+        freqs = position_ids.float().reshape(-1, 1) * self.inv_freq
+        emb = torch.cat((freqs, freqs), dim=-1)
+        rope_embeds = torch.stack([emb.cos(), emb.sin()]).unsqueeze(-2).unsqueeze(1)
+        attention_bias = 1 - attention_mask.float()
+        hidden_states = self.embedding_layernorm(inputs_embeds + self.token_type_embeddings)
+        for i in range(self.num_hidden_layers):
+            hidden_states = self.blocks[i](hidden_states, attention_bias, rope_embeds)[0]
+        sentence_embeddings = hidden_states[:, 0]
+        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
+
+    def forward(self, inputs_embeds, position_ids, attention_mask):
+        if self.model_type == 'bert':
+            return self.bge_forward(inputs_embeds, position_ids, attention_mask)
+        if self.model_type == 'new':
+            return self.gte_forward(inputs_embeds, position_ids, attention_mask)
+        raise RuntimeError(f'Not support embedding model: {self.model_type}!')
 
     def response(self, query):
         self.eval()
@@ -1445,7 +1487,8 @@ class EmbeddingExporter(LlmExporter):
         input_ids = torch.tensor(input_ids)
         position_ids = self.get_position_ids()
         attention_mask = self.get_attention_mask()
-        res = self.forward(input_ids, position_ids, attention_mask)
+        inputs_embeds = self.word_embed(input_ids)
+        res = self.forward(inputs_embeds, position_ids, attention_mask)
         print(res)
         return res
 
@@ -1453,11 +1496,20 @@ class EmbeddingExporter(LlmExporter):
     def load_model(self, model_path):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        self.config = self.model.config
         transformer = self.model.encoder
+        self.model_type = self.config.model_type
         self.lm_ = self.model.pooler
         self.embed_ = self.model.embeddings
-        self.hidden_size = self.embed_.word_embeddings.weight.shape[-1]
+        self.word_embeddings = self.embed_.word_embeddings
+        self.token_type_embeddings = self.embed_.token_type_embeddings.weight.data[0]
+        self.embedding_layernorm = self.embed_.LayerNorm
+        if hasattr(self.embed_, 'position_embeddings'):
+            self.position_embeddings = self.embed_.position_embeddings
+        self.hidden_size = self.word_embeddings.weight.shape[-1]
         self.blocks = transformer.layer
+        if self.model_type == 'new':
+            self.inv_freq = self.embed_.rotary_emb.inv_freq
         # some wrapper
         self.stop_ids = []
         self.num_hidden_layers = len(self.blocks)
@@ -1465,7 +1517,7 @@ class EmbeddingExporter(LlmExporter):
         self.lm = self.lm_
         # some config for export
         self.model_dynamic_axes = {
-            "input_ids" : { 0: "seq_len" },
+            "input_ids" : { 1: "seq_len" },
             "position_ids" : { 1: "seq_len" },
             "attention_mask" : { 3: "seq_len" }
         }
@@ -1487,9 +1539,10 @@ class EmbeddingExporter(LlmExporter):
         input_ids = torch.arange(3, dtype=torch.long)
         position_ids = self.get_position_ids()
         attention_mask = self.get_attention_mask()
-        onnx_model = f'{self.dst_path}/bge.onnx'
+        inputs_embeds = self.word_embed(input_ids)
+        onnx_model = f'{self.dst_path}/{self.dst_name}.onnx'
         torch.onnx.export(
-            model, (input_ids, position_ids, attention_mask),
+            model, (inputs_embeds, position_ids, attention_mask),
             onnx_model,
             input_names=[
                 'input_ids',
@@ -1503,16 +1556,21 @@ class EmbeddingExporter(LlmExporter):
         return onnx_model
 
     def export(self, export_type):
+        export_mnn = 'mnn' in export_type
         self.export_tokenizer()
-        self.export_config()
+        self.export_config(export_mnn)
+        self.export_embed()
         onnx_model = self.export_onnx()
         if not self.skip_slim:
             self.onnx_slim(onnx_model)
-        if 'mnn' in export_type:
+        if export_mnn:
             MNNConveter(onnx_model, None, self).export()
 
     def build_prompt(self, query):
+        if self.model_type == 'bert':
             return f'[CLS]{query}[SEP]'
+        if self.model_type == 'new':
+            return f'<s> {query}</s>'
 
     def get_position_ids(self) -> torch.Tensor:
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
@@ -1573,7 +1631,7 @@ def main():
     model_path = args.path
     model_type = args.type
 
-    if 'bge' in model_path:
+    if 'gte' in model_path or 'bge' in model_path:
         llm_exporter = EmbeddingExporter(args)
     else:
         llm_exporter = LlmExporter(args)
