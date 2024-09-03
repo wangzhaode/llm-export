@@ -26,6 +26,7 @@ EXPORT_LOG = '.export.log'
 # ignore warnning info
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def spinner_run(text='Processing...'):
     def decorator(func):
@@ -310,7 +311,7 @@ class OnnxRebuilder:
     def make_external(self, name, data, shape):
         # write to external weight
         length = self.onnx_weight.write(data.tobytes())
-        location = self.onnx_weight_path
+        location = os.path.basename(self.onnx_weight_path)
         offset = self.onnx_weight_offset
         self.onnx_weight_offset += length
         tensor = onnx.TensorProto()
@@ -377,9 +378,12 @@ class MNNConveter:
         self.onnx_model_path = onnx_path
         self.mnn_model_path = onnx_path.replace('.onnx', '.mnn')
         self.mnn_weight_path = f'{self.mnn_model_path}.weight'
+        if os.path.exists(config.mnnconvert):
+            self.mnnconvert = config.mnnconvert
+        else:
+            self.mnnconvert = None
 
-    @staticmethod
-    def convert(convert_args):
+    def convert(self, convert_args):
         sfd = os.dup(1)
         log_fp = open(EXPORT_LOG, "a")
         log_fd = log_fp.fileno()
@@ -388,16 +392,21 @@ class MNNConveter:
         try:
             sys.argv = convert_args
             sys.argc = len(convert_args)
-            from MNN.tools import mnnconvert
-            mnnconvert.main()
+            if self.mnnconvert is None:
+                from MNN.tools import mnnconvert
+                mnnconvert.main()
+            else:
+                convert_args[0] = self.mnnconvert
+                cmd = ' '.join(convert_args)
+                message = os.popen(cmd).read()
+                print(message)
             sys.argv = []
         finally:
             os.dup2(sfd, 1)
             os.close(log_fd)
 
-    @staticmethod
     @spinner_run(f'convert onnx model to ')
-    def onnx2mnn(onnx_path, mnn_path, args = []):
+    def onnx2mnn(self, onnx_path, mnn_path, args = []):
         convert_args = [
             '',
             '-f',
@@ -410,11 +419,10 @@ class MNNConveter:
             '--allowCustomOp'
         ]
         convert_args += args
-        MNNConveter.convert(convert_args)
+        self.convert(convert_args)
         return mnn_path
 
-    @staticmethod
-    def mnn2json(mnn_path, json_path):
+    def mnn2json(self, mnn_path, json_path):
         convert_args = [
             '',
             '-f',
@@ -424,11 +432,10 @@ class MNNConveter:
             '--JsonFile',
             str(json_path)
         ]
-        MNNConveter.convert(convert_args)
+        self.convert(convert_args)
         return json_path
 
-    @staticmethod
-    def json2mnn(json_path, mnn_path):
+    def json2mnn(self, json_path, mnn_path):
         convert_args = [
             '',
             '-f',
@@ -438,7 +445,7 @@ class MNNConveter:
             '--MNNModel',
             str(mnn_path)
         ]
-        MNNConveter.convert(convert_args)
+        self.convert(convert_args)
         return mnn_path
 
     def export(self):
@@ -449,13 +456,13 @@ class MNNConveter:
                 '--weightQuantBlock',
                 str(self.quant_block)
             ]
-            MNNConveter.onnx2mnn(self.onnx_model_path, self.mnn_model_path, quant_args)
+            self.onnx2mnn(self.onnx_model_path, self.mnn_model_path, quant_args)
         else:
             mnn_json = f'{self.mnn_model_path}.json'
-            MNNConveter.onnx2mnn(self.onnx_model_path, self.mnn_model_path)
-            MNNConveter.mnn2json(self.mnn_model_path, mnn_json)
+            self.onnx2mnn(self.onnx_model_path, self.mnn_model_path)
+            self.mnn2json(self.mnn_model_path, mnn_json)
             self.rebuild(mnn_json)
-            MNNConveter.json2mnn(mnn_json, self.mnn_model_path)
+            self.json2mnn(mnn_json, self.mnn_model_path)
 
     @spinner_run(f'quant model weight to ')
     def rebuild(self, json_path):
@@ -611,7 +618,7 @@ class MNNConveter:
                 "quanParameter": {
                     "quantScale": 1.0, "scaleIn": 0.0, "scaleOut": 0.0,
                     "useInt32": False, "has_scaleInt": False, "shapeInt32": shape_int32,
-                    "type": 1, "aMax": 0, "aMin": q_min, "readType": oc, "weightSize": 0
+                    "type": 1, "aMax": 0, "aMin": q_min, "readType": oc * (ic // self.quant_block), "weightSize": 0
                 },
                 "external": external
             },
@@ -911,7 +918,6 @@ class LlmExporter(torch.nn.Module):
         self.max_length = 1024
         self.stop_ids = []
         self.visual = None
-        self.withou_embedding = False
         self.dst_name = 'llm'
         # load config from args
         self.path = args.path
@@ -920,6 +926,7 @@ class LlmExporter(torch.nn.Module):
         self.skip_slim = args.skip_slim
         self.quant_bit = args.quant_bit
         self.quant_block = args.quant_block
+        self.mnnconvert = args.mnnconvert
         if args.lm_quant_bit is not None:
             self.lm_quant_bit = args.lm_quant_bit
         else:
@@ -1080,7 +1087,8 @@ class LlmExporter(torch.nn.Module):
             input_embeds = self.embed(input_ids)
         return input_embeds
 
-    def forward_impl(self, hidden_states, attention_mask, position_ids, past_key_values):
+    def forward(self, input_ids, attention_mask, position_ids, past_key_values):
+        hidden_states = input_ids # llm forward without embedding
         presents = []
         rotary_pos_emb = self.rotary(position_ids)
         for i in range(self.num_hidden_layers):
@@ -1091,11 +1099,6 @@ class LlmExporter(torch.nn.Module):
         self.seq_len += 1
         self.token_len += 1
         return logits, presents
-
-    def forward(self, input_ids, attention_mask, position_ids, past_key_values):
-        if self.withou_embedding:
-            return self.forward_impl(input_ids, attention_mask, position_ids, past_key_values)
-        return self.forward_impl(self.embedding(input_ids), attention_mask, position_ids, past_key_values)
 
     # some test functions
     def build_prompt(self, query):
@@ -1154,7 +1157,8 @@ class LlmExporter(torch.nn.Module):
         while self.token_len < self.max_length:
             attention_mask = self.get_attention_mask()
             position_ids = self.get_position_ids()
-            logits, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
+            input_ids = self.embed(token_id)
+            logits, past_key_values = self.forward(input_ids, attention_mask, position_ids, past_key_values)
             token_id = torch.argmax(logits)
             if token_id in self.stop_ids:
                 print("", end='\n')
@@ -1310,9 +1314,7 @@ class LlmExporter(torch.nn.Module):
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape)
         onnx_model = f'{self.dst_path}/{self.dst_name}.onnx'
-        # mnn export
-        if self.withou_embedding:
-            input_ids = self.embedding(input_ids)
+        input_ids = self.embedding(input_ids)
         # export to onnx
         torch.onnx.export(
             model, (input_ids, attention_mask, position_ids, past_key_values),
@@ -1331,11 +1333,9 @@ class LlmExporter(torch.nn.Module):
         # export tokenizer
         self.export_tokenizer()
         self.export_config(export_mnn)
+        self.export_embed()
         if self.visual:
             self.export_visual()
-        if export_mnn:
-            self.export_embed()
-            self.withou_embedding = True
         # export graph to llm.onnx
         onnx_model = self.export_onnx()
         if not self.skip_slim:
@@ -1682,6 +1682,7 @@ def main():
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
     parser.add_argument('--quant_block', type=int, default=128, help='mnn quant block, default is 0 mean channle-wise.')
     parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head quant bit, 4 or 8, default is `quant_bit`.')
+    parser.add_argument('--mnnconvert', type=str, default='../../../build/MNNConvert', help='local mnnconvert path, if invalid, using pymnn.')
 
     args = parser.parse_args()
 

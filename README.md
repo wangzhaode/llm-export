@@ -44,15 +44,19 @@ llmexport --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 - 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
 - 默认会使用onnx-slim对onnx模型进行优化，跳过该步骤使用`--skip_slim`
 - 支持合并lora权重后导出，指定lora权重的目录使用`--lora_path`
+- 制定量化bit数使用`--quant_bit`；量化的block大小使用`--quant_block`
+- 使用`--lm_quant_bit`来制定lm_head层权重的量化bit数，不指定则使用`--quant_bit`的量化bit数
+- 支持使用自己编译的`MNNConvert`，使用`--mnnconvert`
 
 ## 参数
 ```
-usage: llmexport [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT] [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK]
-                 [--lm_quant_bit LM_QUANT_BIT]
+usage: llmexport.py [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT]
+                    [--skip_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK] [--lm_quant_bit LM_QUANT_BIT]
+                    [--mnnconvert MNNCONVERT]
 
 llm_exporter
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   --path PATH           path(`str` or `os.PathLike`):
                         Can be either:
@@ -72,6 +76,8 @@ optional arguments:
                         mnn quant block, default is 0 mean channle-wise.
   --lm_quant_bit LM_QUANT_BIT
                         mnn lm_head quant bit, 4 or 8, default is `quant_bit`.
+  --mnnconvert MNNCONVERT
+                        local mnnconvert path, if invalid, using pymnn.
 ```
 
 ## 支持模型
