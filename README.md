@@ -48,6 +48,14 @@ llmexport --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
 - 使用`--lm_quant_bit`来制定lm_head层权重的量化bit数，不指定则使用`--quant_bit`的量化bit数
 - 支持使用自己编译的`MNNConvert`，使用`--mnnconvert`
 
+`--test`测试示例
+```sh
+# 测试文本输入
+llmexport --path Qwen2-1.5B-Instruct --test "你好"
+# 测试图像文本
+llmexport --path Qwen2-VL-2B-Instruct  --test "<img>https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg</img>介绍一下图片里的内容"
+```
+
 ## 参数
 ```
 usage: llmexport.py [-h] --path PATH [--type TYPE] [--lora_path LORA_PATH] [--dst_path DST_PATH] [--test TEST] [--export EXPORT]
