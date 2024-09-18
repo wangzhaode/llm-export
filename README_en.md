@@ -24,18 +24,25 @@ pip install .
 ```
 
 ## Usage
-1. Clone the LLM project that you want to export locally, such as: chatglm2-6b
+1. download the model, Clone the LLM project that you want to export locally, such as: chatglm2-6b
 ```sh
-git clone https://huggingface.co/THUDM/chatglm2-6b
+git clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct
 # If downloading from Hugging Face is slow, you can use ModelScope
-git clone https://modelscope.cn/ZhipuAI/chatglm2-6b.git
+git clone https://modelscope.cn/qwen/Qwen2-1.5B-Instruct.git
+```
+2. test the model
+```sh
+# Test text
+llmexport --path Qwen2-1.5B-Instruct --test "Hello"
+# Test image text
+llmexport --path Qwen2-VL-2B-Instruct  --test "<img>https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg</img>Describe the content of the picture"
 ```
 2. export the model
 ```sh
 # export chatglm2-6b to onnx
-llmexport --path ../chatglm2-6b --export onnx
+llmexport --path Qwen2-1.5B-Instruct --export onnx
 # export chatglm2-6b to mnn and quant
-llmexport --path ../chatglm2-6b --export mnn --quant_bit 4 --quant_block 128
+llmexport --path Qwen2-1.5B-Instruct --export mnn --quant_bit 4 --quant_block 128
 ```
 
 ## Features
