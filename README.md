@@ -91,7 +91,7 @@ options:
 ## 支持模型
 
 - llama/llama2/llama3/tinyllama
-- qwen/qwen1.5/qwen2/qwen-vl
+- qwen/qwen1.5/qwen2/qwen-vl/qwen2-vl/qwen2.5
 - baichuan2/phi-2/internlm/yi/deepseek
 - chatglm/codegeex/chatglm2/chatglm3
 - phi-2/gemma-2
