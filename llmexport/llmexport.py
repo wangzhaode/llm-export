@@ -1282,7 +1282,7 @@ class LlmExporter(torch.nn.Module):
     # some test functions
     def build_prompt(self, query):
         # just for test
-        if 'Qwen2' in self.path:
+        if 'Qwen2' in self.path or 'reader' in self.path:
             return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
         if 'Qwen' in self.path:
             return f'\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
