@@ -81,7 +81,7 @@ optional arguments:
 
 ## Support models
 
-- llama/llama2/llama3/tinyllama
+- llama/llama2/llama3/llama3.2/tinyllama
 - qwen/qwen1.5/qwen2/qwen-vl/qwen2-vl/qwen2.5
 - baichuan2/phi-2/internlm/yi/deepseek
 - chatglm/codegeex/chatglm2/chatglm3

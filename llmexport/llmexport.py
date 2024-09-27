@@ -569,6 +569,7 @@ class MNNConveter:
                (linear.bias is not None) == has_bias)
 
         quant_bit = self.lm_quant_bit if 'lm_head' in name else self.quant_bit
+        block_size = ic if self.quant_block == 0 else self.quant_block
         external, q_min, shape_int32 = self.build_weight(linear, quant_bit, self.quant_block)
 
         origin_input = op['inputIndexes']
@@ -626,7 +627,7 @@ class MNNConveter:
                 "quanParameter": {
                     "quantScale": 1.0, "scaleIn": 0.0, "scaleOut": 0.0,
                     "useInt32": False, "has_scaleInt": False, "shapeInt32": shape_int32,
-                    "type": 1, "aMax": 0, "aMin": q_min, "readType": oc * (ic // self.quant_block), "weightSize": 0
+                    "type": 1, "aMax": 0, "aMin": q_min, "readType": oc * (ic // block_size), "weightSize": 0
                 },
                 "external": external
             },
