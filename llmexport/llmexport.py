@@ -9,6 +9,7 @@ import logging
 import warnings
 import argparse
 import functools
+import traceback
 from typing import Optional, Tuple
 
 from yaspin import yaspin
@@ -38,7 +39,7 @@ def spinner_run(text='Processing...'):
                     result = func(*args, **kwargs)
                 except Exception as e:
                     spinner.fail("💥 Failed")
-                    print(e)
+                    traceback.print_exc()
                     exit(1)
                 end = time.time()
                 during = f'[{end-start:05.2f} s]'.replace('[0', '[ ')
@@ -81,6 +82,7 @@ class ModelMapper:
         self.regist_glm2()
         self.regist_phi()
         self.regist_gemma2()
+        self.register_openelm()
 
     def regist_llama(self):
         llama_map = self.default_map
@@ -215,6 +217,41 @@ class ModelMapper:
         }
         self.regist('gemma2', gemma2_map)
 
+    def register_openelm(self):
+        openelm_config = {
+            'hidden_size': 'model_dim',
+            'head_dim': 'head_dim',
+            'num_attention_heads': 'num_query_heads',
+            'num_hidden_layers': 'num_transformer_layers',
+            'num_key_value_heads': 'num_kv_heads',
+            'rope_theta': 'rope_freq_constant'
+        }
+        openelm_model = {
+            'lm_': 'lm_head',
+            'embed_': 'transformer.token_embeddings',
+            'blocks_': 'transformer.layers',
+            'final_layernorm_': 'transformer.norm'
+        }
+        openelm_decoder = {
+            'self_attn': 'attn',
+            'mlp': 'ffn',
+            'input_layernorm': 'attn_norm',
+            'post_attention_layernorm': 'ffn_norm'
+        }
+        openelm_attention = {
+            'qkv_proj': 'qkv_proj',
+            'o_proj': 'out_proj',
+            'q_norm': 'q_norm',
+            'k_norm': 'k_norm'
+        }
+        openelm_map = {
+            'config': openelm_config,
+            'model': openelm_model,
+            'decoder': openelm_decoder,
+            'attention': openelm_attention
+        }
+        self.regist('openelm', openelm_map)
+
     def defualt_map(self):
         # default map is `LlamaForCausalLM`
         self.config_key = 'config'
@@ -269,10 +306,12 @@ class ModelMapper:
 
 
 # Export class
-class LlmExporterOp(torch.autograd.Function):
+
+# custom op start
+
+class FakeLinearOp(torch.autograd.Function):
     @staticmethod
     def symbolic(g, input, in_features, out_features, has_bias, name):
-        args = [input]
         # These become the operator attributes.
         kwargs = {
             "in_features_i": in_features,
@@ -299,7 +338,36 @@ class FakeLinear(torch.nn.Module):
         self.name = name
 
     def forward(self, x):
-        return LlmExporterOp.apply(x, self.in_features, self.out_features, self.has_bias, self.name)
+        return FakeLinearOp.apply(x, self.in_features, self.out_features, self.has_bias, self.name)
+
+class FusedAttentionOp(torch.autograd.Function):
+    @staticmethod
+    def symbolic(g, query, key, value, attention_mask, hidden_size, name):
+        # These become the operator attributes.
+        kwargs = {
+            "hidden_size_i": hidden_size,
+            "name_s": name
+        }
+        from torch.onnx.symbolic_helper import _get_tensor_sizes
+        out_sizes = _get_tensor_sizes(query)
+        output_type = query.type().with_sizes(out_sizes)
+        return g.op("LlmExporter::FusedAttention", query, key, value, attention_mask, **kwargs).setType(output_type)
+
+    @staticmethod
+    def forward(ctx, query, key, value, attention_mask, hidden_size, name):
+        out_shape = list(query.shape)[:2] + [hidden_size]
+        return query.new_zeros(out_shape)
+
+class FusedAttention(torch.nn.Module):
+    def __init__(self, hidden_size, name):
+        super(FusedAttention, self).__init__()
+        self.hidden_size = hidden_size
+        self.name = name
+
+    def forward(self, query, key, value, attention_mask):
+        return FusedAttentionOp.apply(query, key, value, attention_mask, self.hidden_size, self.name)
+
+# custom op end
 
 class OnnxRebuilder:
     def __init__(self, onnx_path, weight_ops):
@@ -553,6 +621,31 @@ class MNNConveter:
         return tensor_idx
 
     def rebuild_op(self, op, graph):
+        op_type = op['main']['type']
+        if op_type == 'FakeLinear':
+            return self.rebuild_linear(op, graph)
+        if op_type == 'FusedAttention':
+            return self.rebuild_attnention(op, graph)
+
+    def rebuild_attnention(self, op, graph):
+        attrs = op['main']['attr']
+        for attr in attrs:
+            if attr['key'] == 'name':
+                name = attr['s']
+        origin_input = op['inputIndexes']
+        origin_output = op['outputIndexes']
+        fused_attention = {
+            "inputIndexes": origin_input,
+            "main_type": "AttentionParam",
+            "main": { "kv_cache": True },
+            "name": name,
+            "outputIndexes": origin_output,
+            "type": "Attention",
+            "defaultDimentionFormat": "NHWC"
+        }
+        return [fused_attention]
+
+    def rebuild_linear(self, op, graph):
         attrs = op['main']['attr']
         for attr in attrs:
             if attr['key'] == 'name':
@@ -681,23 +774,35 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 class Attention(torch.nn.Module):
-    def __init__(self, attn, config):
+    def __init__(self, attn, layer_id, config):
         super().__init__()
+        self.export_fused_attn = False
+        self.fused_attn = FusedAttention(config.hidden_size, f'/layers.{layer_id}/self_attn/FusedAttention')
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.num_key_value_heads = config.num_key_value_heads
+        if isinstance(config.num_attention_heads, list):
+            self.num_heads = config.num_attention_heads[layer_id]
+            self.num_key_value_heads = config.num_key_value_heads[layer_id]
+        else:
+            self.head_dim = config.head_dim
+            self.num_heads = config.num_attention_heads
+            self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.rotary = config.rotary
         ModelMapper.do_map(self, attn, config.model_map['attention'])
+
         if hasattr(self, 'qkv_proj') and self.qkv_proj is not None:
             # split qkv linear to q, k, v
             split_sizes = [self.hidden_size] * 3
             if self.qkv_proj.weight.shape[0] != self.hidden_size * 3:
                 # M/GQA
-                qkv_hidden_size = self.qkv_proj.weight.shape[0]
-                kv_hidden_size = (qkv_hidden_size - self.hidden_size) // 2
-                split_sizes = [self.hidden_size, kv_hidden_size, kv_hidden_size]
+                split_sizes = [
+                    self.num_heads * self.head_dim,           # q_size
+                    self.num_key_value_heads * self.head_dim, # k_size
+                    self.num_key_value_heads * self.head_dim  # v_size
+                ]
+
             self.q_proj = torch.nn.Linear(self.hidden_size, split_sizes[0])
             self.k_proj = torch.nn.Linear(self.hidden_size, split_sizes[1])
             self.v_proj = torch.nn.Linear(self.hidden_size, split_sizes[2])
@@ -722,6 +827,10 @@ class Attention(torch.nn.Module):
                     self.q_proj.bias.data = qb
                     self.k_proj.bias.data = kb
                     self.v_proj.bias.data = vb
+                else:
+                    self.q_proj.bias.data = torch.zeros(split_sizes[0])
+                    self.k_proj.bias.data = torch.zeros(split_sizes[1])
+                    self.v_proj.bias.data = torch.zeros(split_sizes[2])
 
     def forward(
         self,
@@ -737,6 +846,11 @@ class Attention(torch.nn.Module):
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        # openelm model has qk_norm
+        if hasattr(self, 'q_norm') and hasattr(self, 'k_norm'):
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
         kv_seq_len = key_states.shape[1]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[1]
@@ -745,6 +859,12 @@ class Attention(torch.nn.Module):
         cos, sin = rotary_pos_emb[0], rotary_pos_emb[1]
         query_states = self.rotary.apply_rotary_pos(query_states, cos, sin)
         key_states = self.rotary.apply_rotary_pos(key_states, cos, sin)
+
+        if self.export_fused_attn:
+            attn_output = self.fused_attn(query_states, key_states, value_states, attention_mask)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, past_key_value
+
         # kv cache
         if past_key_value is not None:
             past_key, past_value = past_key_value[0], past_key_value[1]
@@ -844,11 +964,11 @@ class Rotary(torch.nn.Module):
         return torch.cat((x1, x2), dim=-1)
 
 class Decoder(torch.nn.Module):
-    def __init__(self, decoder, config):
+    def __init__(self, decoder, layer_id, config):
         super().__init__()
         ModelMapper.do_map(self, decoder, config.model_map['decoder'])
         self.hidden_size = config.hidden_size
-        self.self_attn = Attention(self.self_attn, config)
+        self.self_attn = Attention(self.self_attn, layer_id, config)
         # chatglm
         self.alpha = (2 * config.num_hidden_layers) ** 0.5 if config.model_type == 'chatglm' else 1.0
 
@@ -1106,7 +1226,7 @@ class LlmExporter(torch.nn.Module):
         self.load_model(args.path)
 
     def init_from_args(self, args):
-        self.max_length = 1024
+        self.max_length = 128
         self.stop_ids = []
         self.visual = None
         self.dst_name = 'llm'
@@ -1114,11 +1234,14 @@ class LlmExporter(torch.nn.Module):
         self.path = args.path
         self.dst_path = args.dst_path
         self.onnx_path = os.path.join(self.dst_path, 'onnx')
+        self.tokenizer_path = args.tokenizer_path
         self.lora_path = args.lora_path
         self.skip_slim = args.skip_slim
         self.quant_bit = args.quant_bit
         self.quant_block = args.quant_block
         self.mnnconvert = args.mnnconvert
+        if self.tokenizer_path is None:
+            self.tokenizer_path = self.path
         if args.lm_quant_bit is not None:
             self.lm_quant_bit = args.lm_quant_bit
         else:
@@ -1130,7 +1253,7 @@ class LlmExporter(torch.nn.Module):
             os.makedirs(self.onnx_path)
 
     def load_pretrained(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path, trust_remote_code=True)
         if 'Qwen2-VL' in model_path:
             from transformers import Qwen2VLForConditionalGeneration
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_path).float().eval()
@@ -1181,9 +1304,15 @@ class LlmExporter(torch.nn.Module):
         if not hasattr(self, 'rope_theta') or self.rope_theta is None:
             self.rope_theta = 10000.0
         if not hasattr(self, 'head_dim') or self.head_dim is None:
-            self.head_dim = self.hidden_size // self.num_attention_heads
+            if isinstance(self.num_attention_heads, list):
+                self.head_dim = [self.hidden_size // atten_head for atten_head in self.num_attention_heads]
+            else:
+                self.head_dim = self.hidden_size // self.num_attention_heads
         # some export info
-        self.past_kv_shape = [self.num_hidden_layers, 2, 1, 0, self.num_key_value_heads, self.head_dim]
+        if isinstance(self.num_attention_heads, list):
+            self.past_kv_shape = [self.num_hidden_layers, 2, 1, 0, self.num_key_value_heads[0], self.head_dim]
+        else:
+            self.past_kv_shape = [self.num_hidden_layers, 2, 1, 0, self.num_key_value_heads, self.head_dim]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
@@ -1207,6 +1336,11 @@ class LlmExporter(torch.nn.Module):
         # load modules
         ModelMapper.do_map(self, self.model, self.model_map['model'])
         # rebuild modules
+        if self.lm_ is None:
+            out_features, in_features = self.embed_.weight.shape
+            self.lm_ = torch.nn.Linear(in_features, out_features)
+            self.lm_.weight = self.embed_.weight
+
         if self.embed_.weight is self.lm_.weight:
             import copy
             embed_copy = copy.deepcopy(self.embed_)
@@ -1217,7 +1351,8 @@ class LlmExporter(torch.nn.Module):
         self.rotary = Rotary(self)
         self.blocks = []
         for block in self.blocks_.children():
-            self.blocks.append(Decoder(block, self))
+            layer_id = len(self.blocks)
+            self.blocks.append(Decoder(block, layer_id, self))
         self.lm = Lm(self.lm_, self.final_layernorm_, self)
         # visual model
         if self.visual is not None:
@@ -1275,7 +1410,8 @@ class LlmExporter(torch.nn.Module):
             hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask, past_key_values[i])
             presents.append(kv)
         logits = self.lm(hidden_states).reshape(-1)
-        presents = torch.stack(presents)
+        if presents[0].shape == presents[-1].shape:
+            presents = torch.stack(presents)
         self.seq_len += 1
         self.token_len += 1
         return logits, presents
@@ -1313,6 +1449,8 @@ class LlmExporter(torch.nn.Module):
             return f'Instruct: {query}\nOutput:'
         if 'gemma-2' in self.path:
             return f'<bos><start_of_turn>user\n{query}<end_of_turn>\n<start_of_turn>model\n'
+        if 'OpenELM' in self.path:
+            return f'<s>{query}'
         return query
 
     def str_to_ids(self, prompt):
@@ -1464,6 +1602,9 @@ class LlmExporter(torch.nn.Module):
         # replace linear with fakelinear to save export memory and time
         with torch.no_grad():
             for i in range(self.num_hidden_layers):
+                # different kv cache shape in different layers
+                if isinstance(self.num_attention_heads, list):
+                    self.blocks[i].self_attn.export_fused_attn = True
                 for name, child in self.blocks[i].self_attn.named_children():
                     if isinstance(child, torch.nn.Linear):
                         setattr(self.blocks[i].self_attn, name, build_faker(child, f'/layers.{i}/self_attn/{name}/Linear'))
@@ -1493,9 +1634,10 @@ class LlmExporter(torch.nn.Module):
         input_ids = torch.arange(3, dtype=torch.long)
         attention_mask =  self.get_attention_mask()
         position_ids = self.get_position_ids()
-        past_key_values = torch.zeros(self.past_kv_shape)
         onnx_model = f'{self.onnx_path}/{self.dst_name}.onnx'
         input_ids = self.embedding(input_ids)
+        past_key_values = torch.zeros(self.past_kv_shape)
+
         # export to onnx
         torch.onnx.export(
             model, (input_ids, attention_mask, position_ids, past_key_values),
@@ -1506,6 +1648,7 @@ class LlmExporter(torch.nn.Module):
             output_names=['logits', 'presents'],
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
+            verbose=False,
             opset_version=15)
         return onnx_model
 
@@ -1535,8 +1678,8 @@ class LlmExporter(torch.nn.Module):
     @spinner_run(f'export tokenizer to ')
     def export_tokenizer(self):
         # load tokenizer file
-        tokenizer_model = os.path.join(self.path, 'tokenizer.model')
-        ice_text_model = os.path.join(self.path, 'ice_text.model')
+        tokenizer_model = os.path.join(self.tokenizer_path, 'tokenizer.model')
+        ice_text_model = os.path.join(self.tokenizer_path, 'ice_text.model')
         try:
             import sentencepiece as spm
             if os.path.exists(tokenizer_model):
@@ -1859,8 +2002,10 @@ def main():
                         help='type(`str`, *optional*):'
                         '\n\tThe pretrain llm model type.'
                         )
+    parser.add_argument('--tokenizer_path', type=str, default=None, help='tokenizer path, defaut is `None` mean using `--path` value.')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, defaut is `None` mean not apply lora.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, defaut is `./model`.')
+    parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
