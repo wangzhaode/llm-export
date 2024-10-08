@@ -425,7 +425,7 @@ class OnnxRebuilder:
                     # fakelinear -> matmul + add
                     middle_tensor = f'{name}_matmul'
                     new_nodes.append(helper.make_node('MatMul', [node.input[0], weight], [middle_tensor], name))
-                    new_nodes.append(helper.make_node('Add', [middle_tensor, bias], node.output, name))
+                    new_nodes.append(helper.make_node('Add', [middle_tensor, bias], node.output, f'{name}/Add'))
                 else:
                     # fakelinear -> matmul
                     new_nodes.append(helper.make_node('MatMul', [node.input[0], weight], node.output, name))
