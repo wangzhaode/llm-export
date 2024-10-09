@@ -1322,8 +1322,8 @@ class LlmExporter(torch.nn.Module):
         self.model_dynamic_axes = {
             "input_ids" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
-            "position_ids" : { 0: "seq_len" },
-            "past_key_values" : { 2: "history_len" }
+            "position_ids" : { 1: "seq_len" },
+            "past_key_values" : { 3: "history_len" }
         }
         self.llm_config = {
             'hidden_size' : self.hidden_size,
@@ -1370,8 +1370,8 @@ class LlmExporter(torch.nn.Module):
         if self.model_type == 'chatglm':
             return self.chatglm_position_ids()
         if self.token_len:
-            return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
-        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+            return torch.tensor([[self.seq_len - 1]], dtype=torch.int)
+        return torch.arange(self.seq_len, dtype=torch.int).unsqueeze(0)
 
     def chatglm_attention_mask(self):
         if self.token_len:
@@ -1385,8 +1385,8 @@ class LlmExporter(torch.nn.Module):
     def chatglm_position_ids(self):
         if self.token_len:
             return torch.tensor([self.context_len, self.token_len + 1]).reshape([1, 2, 1])
-        position_ids_0 = torch.arange(self.seq_len, dtype=torch.long)
-        position_ids_1 = torch.zeros(self.seq_len, dtype=torch.long)
+        position_ids_0 = torch.arange(self.seq_len, dtype=torch.int)
+        position_ids_1 = torch.zeros(self.seq_len, dtype=torch.int)
         position_ids_0[-1] = position_ids_0[-2]
         position_ids_1[-1] = 1
         position_ids = torch.stack([position_ids_0, position_ids_1]).view(1, 2, -1)
