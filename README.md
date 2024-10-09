@@ -8,7 +8,8 @@ llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn
 - 🚀 优化原始代码，减少常量部分
 - 🚀 使用[OnnxSlim](https://github.com/inisis/OnnxSlim)优化onnx模型，性能提升约5%; by [@inisis](https://github.com/inisis)
 - 🚀 支持将lora权重导出为onnx和mnn
-- 🚀 Onnx推理代码[OnnxLLM](https://github.com/inisis/OnnxLLM)
+- 🚀 MNN推理代码[mnn-llm](https://github.com/wangzhaode/mnn-llm)
+- 🚀 Onnx推理代码[onnx-llm](https://github.com/wangzhaode/onnx-llm), [OnnxLLM](https://github.com/inisis/OnnxLLM)
 
 ## 安装
 ```sh
