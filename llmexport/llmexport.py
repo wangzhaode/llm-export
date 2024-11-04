@@ -94,6 +94,7 @@ class ModelMapper:
         self.regist('llama', llama_map)
         self.regist('qwen2', llama_map)
         self.regist('internlm', llama_map)
+        self.regist('mobilellm', llama_map)
         # baichuan
         baichuan_map = copy.deepcopy(self.default_map)
         baichuan_map[self.attention_key] = {
@@ -365,9 +366,7 @@ class AwqQuantizer:
         self.tokenizer = model.tokenizer
         self.w_bit = model.quant_bit
         self.group_size = model.quant_block
-        self.zeropoint = False
-        # self.calib_data = model.calib_data
-        # self.split = model.split
+        self.zeropoint = not model.symmetric
         self.calib_data = 'ag_news'
         self.split = 'test'
         self.duo_scaling = True
@@ -390,42 +389,20 @@ class AwqQuantizer:
             w = w.reshape(-1, self.group_size)
         assert w.dim() == 2
         assert torch.isnan(w).sum() == 0
-
         # zero point quantization
         if self.zeropoint:
-            '''
-            max_val = w.amax(dim=1, keepdim=True)
-            min_val = w.amin(dim=1, keepdim=True)
-            max_int = 2**self.w_bit - 1
-            min_int = 0
-            scales = (max_val - min_val).clamp(min=1e-5) / max_int
-            zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
-            w = (
-                torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
-            ) * scales
-            zeros = zeros.view(org_w_shape[0], -1)
-            '''
-            #'''
             max_val = w.amax(dim=1, keepdim=True)
             min_val = w.amin(dim=1, keepdim=True)
             offset = 1 << (self.w_bit - 1)
             clip_max = offset - 1
             clip_min = -offset
             scales = (max_val - min_val) / (clip_max - clip_min)
+            zeros =  - torch.round(min_val / scales) + clip_min
+            qw = torch.round(w / scales) + zeros
+            qw = torch.clamp(qw, clip_min, clip_max)
+            w = (qw - zeros) * scales
             zeros = min_val.view(org_w_shape[0], -1)
-            qw = torch.clamp(torch.round((w - min_val) / scales) + clip_min, clip_min, clip_max)
-            w = (qw - clip_min) * scales + min_val
-            #'''
         else:
-            '''
-            max_val = w.abs().amax(dim=1, keepdim=True)
-            max_val = max_val.clamp(min=1e-5)
-            max_int = 2 ** (self.w_bit - 1) - 1
-            min_int = -(2 ** (self.w_bit - 1))
-            scales = max_val / max_int
-            zeros = None
-            w = torch.clamp(torch.round(w / scales), min_int, max_int) * scales
-            '''
             abs_max = w.abs().amax(dim=1, keepdim=True)
             offset = 1 << (self.w_bit - 1)
             clip_max = offset - 1
@@ -464,7 +441,7 @@ class AwqQuantizer:
                 ].to(common_device)
 
             self.inps = self.inps.to(common_device)
-            print(f'# {i} inps shape: {self.inps.shape}, inps.max: {self.inps.max()}')
+            # print(f'# {i} inps shape: {self.inps.shape}, inps.max: {self.inps.max()}')
 
             # [STEP 1]: Get layer, extract linear modules, extract input features
             named_linears = AwqQuantizer.get_named_linears(self.modules[i])
@@ -522,7 +499,7 @@ class AwqQuantizer:
                 self._search_best_scale(self.modules[i], **layer)
                 for layer in module_config
             ]
-            print(scales_list); exit(0)
+            # print(scales_list); exit(0)
             AwqQuantizer.apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
             # [STEP 3]: Compute and apply clipping list
             if self.apply_clip:
@@ -1316,7 +1293,7 @@ class MNNConveter:
         self.quant_block = config.quant_block
         self.quant_bit = config.quant_bit
         self.lm_quant_bit = config.lm_quant_bit
-        self.zeropoint = config.zeropoint
+        self.symmetric = config.symmetric
         self.mnn_weight_offset = 0
         self.onnx_model_path = onnx_path
         self.mnn_name = os.path.basename(onnx_path).replace('.onnx', '.mnn')
@@ -1430,7 +1407,7 @@ class MNNConveter:
             json.dump(mnn_graph, file, ensure_ascii=False, indent=4)
         return self.mnn_weight_path
 
-    def quant(self, weight, quant_bit, quant_block, zeropoint):
+    def quant(self, weight, quant_bit, quant_block, symmetric):
         weight = weight.numpy()
         oc, ic = weight.shape
         if quant_block == 0:
@@ -1441,28 +1418,36 @@ class MNNConveter:
         weight = weight.reshape(oc, block_num, block_size)
         offset = 1 << (quant_bit - 1)
         clip_max = offset - 1
-        if zeropoint:
-            clip_min = -offset
-            max_val = np.max(weight, axis=-1, keepdims=True)
-            min_val = np.min(weight, axis=-1, keepdims=True)
-            scale = (max_val - min_val) / (clip_max - clip_min)
-
-            # q_weight = np.round((weight - min_val) / scale) + clip_min
-            q_weight = np.round(weight / scale) - np.round(min_val / scale) + clip_min
-            q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
-            alpha = np.stack([min_val.flatten(), scale.flatten()], axis=-1).flatten()
-        else:
+        if symmetric:
             clip_min = -clip_max
             abs_max = np.max(np.abs(weight), axis=-1, keepdims=True)
             scale = abs_max / clip_max
             q_weight = np.round(weight / scale)
             q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
             alpha = scale.flatten()
+        else:
+            clip_min = -offset
+            max_val = np.max(weight, axis=-1, keepdims=True)
+            min_val = np.min(weight, axis=-1, keepdims=True)
+            scale = (max_val - min_val) / (clip_max - clip_min)
+
+            import MNN
+            if MNN.version() <= '2.9.6':
+                q_weight = np.round((weight - min_val) / scale) + clip_min
+                zeros = min_val
+                aMin = clip_min
+            else:
+                q_weight = np.round(weight / scale) - np.round(min_val / scale) + clip_min
+                zeros =  (np.round(min_val / scale) - clip_min) * scale
+                aMin = 1
+            q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
+            alpha = np.stack([zeros.flatten(), scale.flatten()], axis=-1).flatten()
         q_weight = q_weight.reshape(-1, 2)
         if quant_bit == 4:
             q_weight = q_weight[:, 0] * 16 + q_weight[:, 1]
 
-        return q_weight, alpha, clip_min
+
+        return q_weight, alpha, aMin
 
     def write_npy(self, data):
         return self.mnn_weight.write(data.tobytes())
@@ -1483,12 +1468,18 @@ class MNNConveter:
         header_length = dim_num + dim_length + map_length
         return header_length, shape_dtype == np.int32
 
-    def build_weight(self, linear, quant_bit, quant_block, zeropoint):
+    def build_weight(self, linear, quant_bit, quant_block, symmetric):
         ic, oc = linear.in_features, linear.out_features
-        q_weight, alpha, q_min = self.quant(linear.weight.data, quant_bit, quant_block, zeropoint)
-        header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
-        weight_len = self.write_npy(q_weight) + header_len
-        alpha_len = self.write_npy(alpha)
+        if quant_bit == 16:
+            half_weight = linear.weight.data.half().flatten().numpy()
+            weight_len = self.write_npy(half_weight)
+            alpha_len, q_min, shape_int32 = 0, 0, False
+        else:
+            assert(quant_bit in (4, 8))
+            q_weight, alpha, q_min = self.quant(linear.weight.data, quant_bit, quant_block, symmetric)
+            header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
+            weight_len = self.write_npy(q_weight) + header_len
+            alpha_len = self.write_npy(alpha)
         if linear.bias is not None:
             bias = linear.bias.data.flatten().numpy()
             bias_length = self.write_npy(bias)
@@ -1548,7 +1539,7 @@ class MNNConveter:
 
         quant_bit = self.lm_quant_bit if 'lm_head' in name else self.quant_bit
         block_size = ic if self.quant_block == 0 else self.quant_block
-        external, q_min, shape_int32 = self.build_weight(linear, quant_bit, self.quant_block, self.zeropoint)
+        external, q_min, shape_int32 = self.build_weight(linear, quant_bit, self.quant_block, self.symmetric)
 
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
@@ -1589,12 +1580,22 @@ class MNNConveter:
             },
             "defaultDimentionFormat": "NHWC"
         }
-        if self.zeropoint:
-            aMin = q_min
-            readType = oc * (ic // block_size)
+
+        if quant_bit == 16:
+            quanParameter = { "type": 3 }
         else:
-            aMin = 0
-            readType = 0
+            if self.symmetric:
+                aMin = 0
+                readType = 0
+            else:
+                aMin = q_min
+                readType = oc * (ic // block_size)
+
+            quanParameter = {
+                "quantScale": 1.0, "scaleIn": 0.0, "scaleOut": 0.0,
+                "useInt32": False, "has_scaleInt": False, "shapeInt32": shape_int32,
+                "type": 1, "aMax": 0, "aMin": aMin, "readType": readType, "weightSize": 0
+            }
         conv_op = {
             "name": conv_name,
             "inputIndexes": pre_convert_output,
@@ -1608,11 +1609,7 @@ class MNNConveter:
                     'outputCount': oc, 'relu': False, 'padMode': 'CAFFE',
                     'relu6': False, 'inputCount': ic, 'hasOutputShape': False
                 },
-                "quanParameter": {
-                    "quantScale": 1.0, "scaleIn": 0.0, "scaleOut": 0.0,
-                    "useInt32": False, "has_scaleInt": False, "shapeInt32": shape_int32,
-                    "type": 1, "aMax": 0, "aMin": aMin, "readType": readType, "weightSize": 0
-                },
+                "quanParameter": quanParameter,
                 "external": external
             },
             "defaultDimentionFormat": "NHWC"
@@ -1938,10 +1935,10 @@ class Lm(torch.nn.Module):
         self.final_layernorm = final_layernorm_
         self.lm = lm_
         self.hidden_size = config.hidden_size
-        self.all_logits = config.all_logits
+        self.ppl = config.ppl
 
     def forward(self, hidden_states):
-        if not self.all_logits:
+        if not self.ppl:
             # just need last logit for predict next token
             hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         hidden_states = self.final_layernorm(hidden_states)
@@ -2233,10 +2230,11 @@ class LlmExporter(torch.nn.Module):
         self.tokenizer_path = args.tokenizer_path
         self.lora_path = args.lora_path
         self.skip_slim = args.skip_slim
-        self.all_logits = args.all_logits
+        self.ppl = args.ppl
+        self.awq = args.awq
         self.quant_bit = args.quant_bit
         self.quant_block = args.quant_block
-        self.zeropoint = args.zeropoint
+        self.symmetric = args.sym
         self.mnnconvert = args.mnnconvert
         if self.tokenizer_path is None:
             self.tokenizer_path = self.path
@@ -2251,10 +2249,10 @@ class LlmExporter(torch.nn.Module):
             os.makedirs(self.onnx_path)
 
     def load_pretrained(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path, trust_remote_code=True, use_fast=False)
         if 'Qwen2-VL' in model_path:
             from transformers import Qwen2VLForConditionalGeneration
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_path).half().eval()
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_path).float().eval()
         elif 'Llama-3.2' in model_path and 'Vision' in model_path:
             from transformers import MllamaForConditionalGeneration
             self.model = MllamaForConditionalGeneration.from_pretrained(model_path).float().eval()
@@ -2297,7 +2295,7 @@ class LlmExporter(torch.nn.Module):
         model_mapper = ModelMapper()
 
         self.model_type, self.model_map = model_mapper.get_map(self.config)
-        print(self.config, self.model_type, self.model_map, self.model)
+        # print(self.config, self.model_type, self.model_map, self.model)
         # load config info
         ModelMapper.do_map(self, self.config, self.model_map['config'])
         if not hasattr(self, 'num_key_value_heads') or self.num_key_value_heads is None:
@@ -2420,7 +2418,7 @@ class LlmExporter(torch.nn.Module):
             hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask, past_key_values[i])
             presents[i] = kv
         logits = self.lm(hidden_states)
-        if not self.all_logits:
+        if not self.ppl:
             logits = logits.reshape(-1)
         if presents[0].shape == presents[-1].shape and None not in presents:
             presents = torch.stack(presents)
@@ -2478,7 +2476,6 @@ class LlmExporter(torch.nn.Module):
 
     def response(self, query):
         # self.imitate_quant()
-        self.awq_quant()
         prompt = self.build_prompt(query)
         input_ids = self.str_to_ids(prompt)
         if self.visual is not None:
@@ -2561,29 +2558,6 @@ class LlmExporter(torch.nn.Module):
             }
             json.dump(config, f, ensure_ascii=False, indent=4)
         return config_json
-
-    def quant(self, weight, quant_bit, quant_block):
-        weight = weight.numpy()
-        oc, ic = weight.shape
-        if quant_block == 0:
-            block_size = ic
-        else:
-            block_size = quant_block
-        block_num = ic // block_size
-        weight = weight.reshape(oc, block_num, block_size)
-        max_val = np.max(weight, axis=-1, keepdims=True)
-        min_val = np.min(weight, axis=-1, keepdims=True)
-        offset = 1 << (quant_bit - 1)
-        clip_max = offset - 1
-        clip_min = -offset
-        scale = (max_val - min_val) / (clip_max - clip_min)
-        q_weight = np.round((weight - min_val) / scale) + clip_min
-        q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
-        q_weight = q_weight.reshape(-1, 2)
-        if quant_bit == 4:
-            q_weight = q_weight[:, 0] * 16 + q_weight[:, 1]
-        alpha = np.stack([min_val.flatten(), scale.flatten()], axis=-1).flatten()
-        return q_weight, alpha, clip_min
 
     def imitate_quant(self):
         def quant_dequant(linear, quant_bit = self.quant_bit, quant_block = self.quant_block):
@@ -2677,13 +2651,13 @@ class LlmExporter(torch.nn.Module):
         return onnx_model
 
     def awq_quant(self):
-        print('### AWQ quant')
         self.awq_quantizer = AwqQuantizer(self)
         self.awq_quantizer.quantize()
         self.is_awq_quantized = True
 
     def export(self, export_type):
-        # self.awq_quant()
+        if self.awq:
+            self.awq_quant()
         export_mnn = export_type == 'mnn'
         # export tokenizer
         self.export_tokenizer()
@@ -2751,6 +2725,14 @@ class LlmExporter(torch.nn.Module):
         prefix_list = []
         if hasattr(self.tokenizer, 'get_prefix_tokens'):
             prefix_list = self.tokenizer.get_prefix_tokens()
+        if len(prefix_list) == 0:
+            test_txt = 'A'
+            ids = self.tokenizer.encode(test_txt)
+            get_txt = self.tokenizer.decode(ids[-1])
+            if len(ids) > 1 and get_txt == test_txt:
+                prefix_list += ids[:-1]
+                print(prefix_list)
+
         if self.sp_model is not None:
             # senetencepiece
             NORMAL = 1; UNKNOWN = 2; CONTROL = 3
@@ -3041,13 +3023,13 @@ def main():
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
     parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
-    parser.add_argument('--all_logits', action='store_true', help='Whether or not to get all logits of input tokens.')
-    parser.add_argument('--quant_type', type=str, default='RTN', help='Quant type in [RTN, AWQ], default is `RTN`')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
-    parser.add_argument('--zeropoint', action='store_false', help='Whether or not to zeropoint when quant weight, default is True.')
     parser.add_argument('--quant_block', type=int, default=128, help='mnn quant block, default is 0 mean channle-wise.')
     parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head quant bit, 4 or 8, default is `quant_bit`.')
     parser.add_argument('--mnnconvert', type=str, default='../../../build/MNNConvert', help='local mnnconvert path, if invalid, using pymnn.')
+    parser.add_argument('--ppl', action='store_true', help='Whether or not to get all logits of input tokens.')
+    parser.add_argument('--awq', action='store_true', help='Whether or not to use awq quant.')
+    parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), defualt is False.')
 
     args = parser.parse_args()
 
