@@ -2461,6 +2461,8 @@ class LlmExporter(torch.nn.Module):
             return f'<bos><start_of_turn>user\n{query}<end_of_turn>\n<start_of_turn>model\n'
         if 'OpenELM' in self.path:
             return f'<s>{query}'
+        if 'SmolLM2' in self.path:
+            return f'<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
         return query
 
     def str_to_ids(self, prompt):
@@ -2470,12 +2472,28 @@ class LlmExporter(torch.nn.Module):
         return input_ids
 
     def id_to_str(self, token_id):
-        word = self.tokenizer._convert_id_to_token(int(token_id))
-        word = self.tokenizer.convert_tokens_to_string([word])
+        def contains_replacement(text): return '\uFFFD' in text
+        def decode_id(token_id):
+            return self.tokenizer.convert_tokens_to_string(
+                    self.tokenizer._convert_id_to_token(int(token_id)))
+        def decode_ids(token_ids):
+            return self.tokenizer.convert_tokens_to_string(
+                    self.tokenizer.convert_ids_to_tokens(token_ids))
+        word = decode_id(int(token_id))
+        # Smollm tokenizer will produce half chinese character, using buffer to decode
+        if contains_replacement(word):
+            self.decode_buffer.append(token_id)
+            buffer_txt = decode_ids(self.decode_buffer)
+            if not contains_replacement(buffer_txt):
+                word = buffer_txt
+                self.decode_buffer.clear()
+            else:
+                word = ''
         return word
 
     def response(self, query):
         # self.imitate_quant()
+        self.decode_buffer = []
         prompt = self.build_prompt(query)
         input_ids = self.str_to_ids(prompt)
         if self.visual is not None:
