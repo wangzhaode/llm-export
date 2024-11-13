@@ -21,7 +21,7 @@ from yaspin import yaspin
 import onnx
 import torch
 import numpy as np
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 RESET = "\033[0m"
 GREEN = "\033[32;1m"
@@ -2911,8 +2911,9 @@ class EmbeddingExporter(LlmExporter):
     @spinner_run(f'load pretrained model ')
     def load_model(self, model_path):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
-        self.config = self.model.config
+        self.config = AutoConfig.from_pretrained(model_path)
+        self.config._attn_implementation = 'eager'
+        self.model = AutoModel.from_config(self.config)
         transformer = self.model.encoder
         self.model_type = self.config.model_type
         self.lm_ = self.model.pooler
