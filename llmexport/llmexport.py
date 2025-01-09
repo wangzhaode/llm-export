@@ -5,6 +5,7 @@ import math
 import copy
 import json
 import time
+import glob
 import base64
 import logging
 import inspect
@@ -18,6 +19,7 @@ from typing import Optional, Tuple, List, Union, Dict
 from tqdm import tqdm
 from yaspin import yaspin
 
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 import onnx
 import torch
 import numpy as np
@@ -33,14 +35,16 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.ERROR)
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-def spinner_run(text='Processing...'):
+def spinner_run(text='Processing...', hide=False):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             with yaspin(text=text, color="cyan") as spinner:
                 start = time.time()
                 try:
+                    if hide: spinner.hide()
                     result = func(*args, **kwargs)
+                    if hide: spinner.show()
                 except Exception as e:
                     spinner.fail("💥 Failed")
                     traceback.print_exc()
@@ -117,7 +121,8 @@ class ModelMapper:
                 'embed_': 'language_model.model.embed_tokens',
                 'blocks_': 'language_model.model.layers',
                 'final_layernorm_': 'language_model.model.norm',
-                'visual': 'vision_model'
+                'visual': 'vision_model',
+                'multi_modal_projector': 'multi_modal_projector'
             },
             'decoder': {
                 'self_attn': 'self_attn',
@@ -421,7 +426,6 @@ class AwqQuantizer:
 
     def quantize(self):
         for i in tqdm(range(len(self.modules)), desc="AWQ"):
-            # if i > 0: break
             # Move module and inputs to correct device
             common_device = next(self.modules[i].parameters()).device
             if common_device is None or str(common_device) == "cpu":
@@ -1156,6 +1160,272 @@ class AwqQuantizer:
         return sanitized_kwargs
 # awq quantizer end
 
+# GPTQ class
+class GPTQWeight:
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self) -> str:
+        if hasattr(self, 'qweight'):
+            return f'{self.name}, {self.qweight.shape}, {self.scales.shape}'
+        return 'None'
+
+    def add(self, name, tensor):
+        setattr(self, name, tensor)
+
+    def weight(self, idx):
+        shape = self.qweight.shape
+        if len(shape) == 2:
+            ic, oc = shape
+            self.qweight = self.qweight.reshape(ic//16, 16, oc)
+        return self.qweight[idx]
+
+    def scale(self, idx):
+        return self.scales[idx]
+
+class MNNWeight:
+    def __init__(self, name, external, weight_elements):
+        self.name = name
+        self.external = external
+        self.quant_bits = 4
+        if round(weight_elements / external[1]) == 2:
+            self.quant_bits = 4
+            self.a_min = -8
+        else:
+            self.quant_bits = 8
+            self.a_min = -128
+        self.parse_name()
+
+    def __repr__(self) -> str:
+        return f'{self.layer_id}.{self.op_id}.{self.block_id}, {self.external}'
+
+    def parse_name(self):
+        parts = self.name.split('/')
+        if len(parts) > 4:
+            self.layer_id = parts[1].split('.')[1]
+            self.op_id = parts[2] + '.' + parts[3]
+            self.block_id = parts[-1].split('__')[-1]
+        else:
+            self.layer_id = -1
+            self.op_id = parts[2]
+            self.block_id = parts[-1].split('__')[-1]
+
+    def key(self):
+        if self.layer_id == -1: return self.op_id
+        return f'{self.layer_id}.{self.op_id}'
+    def offset(self): return self.external[0]
+    def weight_size(self): return self.external[1]
+    def scale_size(self): return self.external[2]
+
+class GPTQ:
+    def __init__(self, gptq_path):
+        self.load(gptq_path)
+
+    def load(self, path):
+        for tensor in glob.glob(f'{path}/*.safetensors'):
+            self.load_safetensor(tensor)
+
+    def prefix(self, name):
+        splits = name.split('.')
+        if 'lm_head' in splits[0] and len(splits) == 2:
+            return splits[0], splits[1]
+        if len(splits) < 5:
+            return None, None
+        pre = f'{splits[2]}.{splits[3]}.{splits[4]}'
+        suf = splits[-1]
+        return pre, suf
+
+    def get(self, key : str):
+        if key in self.weight_dict:
+            return self.weight_dict[key]
+        return None
+
+    def load_safetensor(self, tensor):
+        self.weight_dict = dict()
+        from safetensors import safe_open
+        with safe_open(tensor, framework="pt") as f:
+            for k in f.keys():
+                p, s = self.prefix(k)
+                if p is None: continue
+                if s not in ['qweight', 'scales']: continue
+                if p not in self.weight_dict:
+                    self.weight_dict[p] = GPTQWeight(p)
+                self.weight_dict[p].add(s, f.get_tensor(k))
+
+    @staticmethod
+    def weight_reorder(qweight, bits=4, group_size=128):
+        oc = qweight.shape[-1]
+        wf = torch.tensor(list(range(0, 32, bits)), dtype=torch.int32).unsqueeze(0)
+        weight = torch.bitwise_right_shift(torch.unsqueeze(qweight, 1).expand(-1, 32 // bits, -1), wf.unsqueeze(-1)).to(torch.int16 if bits == 8 else torch.int8)
+        torch.bitwise_and(weight, (2 ** bits) - 1, out=weight)
+        weight = weight.reshape(-1, oc).transpose(1, 0)
+        if bits == 8:
+            weight = weight.to(torch.uint8)
+            return weight
+        weight = weight.reshape(-1, 2).to(torch.uint8)
+        weight = weight[:, 0] * 16 + weight[:, 1]
+        return weight
+
+    def apply(self, graph_path, weight_path):
+        # parse mnn graph
+        mnn_weights = []
+        mnn_graph = json.load(open(graph_path, 'rt'))
+        for op in mnn_graph['oplists']:
+            if op['type'] == 'Convolution':
+                name = op['name']
+                external = op['main']['external']
+                weight_elements = op['main']['common']['outputCount'] * op['main']['common']['inputCount']
+                mnn_weights.append(MNNWeight(name, external, weight_elements))
+        # load mnn weight
+        external_weight = open(weight_path, 'r+b')
+        for mnn_weight in mnn_weights:
+            gptq_weight = self.get(mnn_weight.key())
+            if gptq_weight is None: continue
+            # print(f'write {mnn_weight.key()} ... ', end='')
+            weight = gptq_weight.qweight
+            scale = gptq_weight.scales.float().transpose(1, 0)
+            # write weight data
+            weight = GPTQ.weight_reorder(weight, mnn_weight.quant_bits)
+            weight_bytes = weight.numpy().tobytes()
+            weight_size = mnn_weight.weight_size()
+            header_len = weight_size - len(weight_bytes)
+            assert(header_len > 0)
+            external_weight.seek(mnn_weight.offset() + header_len)
+            external_weight.write(weight_bytes)
+            scale_size = mnn_weight.scale_size()
+            is_asy = scale.numel() * scale.element_size() < scale_size
+            # write scale data
+            if is_asy:
+                # zeros = mnn_weight.a_min * scale
+                zeros = torch.zeros_like(scale)
+                scale = torch.stack([zeros, scale], axis=-1)
+            scale_bytes = scale.numpy().tobytes()
+            assert(scale_size == len(scale_bytes))
+            external_weight.write(scale_bytes)
+            # print('Done!')
+        external_weight.close()
+# GPTQ end
+
+# Lora class
+class LoRA:
+    def __init__(self, lora_path, scale = 4.0):
+        self.lora_A = {}
+        self.lora_B = {}
+        self.lora_keys = set()
+        self.scale = scale
+        self.load(lora_path)
+
+    def __str__(self):
+        return str(self.lora_keys)
+
+    def has_lora(self, op_name):
+        if op_name[0] != '/':
+            return False
+        for key in self.lora_keys:
+            if key in op_name:
+                return True
+        return False
+
+    def get_lora(self, tag):
+        lora_a, lora_b = self.lora_A[tag], self.lora_B[tag]
+        return lora_a, lora_b
+
+    def load(self, path):
+        if os.path.isdir(path):
+            base_dir = path
+            config = json.load(open(os.path.join(base_dir, 'adapter_config.json'), 'rt'))
+            lora_alpha = config['lora_alpha']
+            r = config['r']
+            self.scale = float(lora_alpha) / r
+            path = os.path.join(base_dir, 'adapter_model.safetensors')
+        from safetensors import safe_open
+        with safe_open(path, framework="pt") as f:
+            for k in f.keys():
+                names = k.split('.')
+                layer, key, name = names[4], names[6], names[7]
+                tag = layer + key
+                tensor = f.get_tensor(k).float()
+                self.lora_keys.add(key)
+                if 'lora_A' == name:
+                    self.lora_A[tag] = tensor
+                else:
+                    self.lora_B[tag] = tensor * self.scale
+
+    def build_conv(self, input_index, output_name, dims, weight):
+        output_index = len(self.base_model['tensorName'])
+        oc, ic = dims
+        bias = [0.0 for i in range(oc)]
+        op = {
+            'type': 'Convolution',
+            'name': output_name,
+            'inputIndexes': [input_index],
+            'outputIndexes': [ output_index ],
+            'main_type': 'Convolution2D',
+            'main': {
+                'common': {
+                    'dilateX': 1, 'dilateY': 1, 'strideX': 1, 'strideY': 1,
+                    'kernelX': 1, 'kernelY': 1, 'padX': 0, 'padY': 0, 'group': 1,
+                    'outputCount': oc, 'relu': False, 'padMode': 'CAFFE',
+                    'relu6': False, 'inputCount': ic, 'hasOutputShape': False
+                },
+                "weight": weight,
+                "bias": bias
+            },
+            'defaultDimentionFormat': 'NHWC'
+        }
+        self.new_ops.append(op)
+        self.base_model['tensorName'].append(output_name)
+        return output_index
+
+    def build_binary(self, op_type, input_indexes, output_name):
+        # 0: Add, 2: Mul
+        output_index = len(self.base_model['tensorName'])
+        op = {
+            "type": "BinaryOp",
+            "name": output_name,
+            "inputIndexes": input_indexes,
+            "outputIndexes": [ output_index ],
+            "main_type": "BinaryOp",
+            "main": { "opType": 0, "T": "DT_FLOAT", "activationType": 0 },
+            "defaultDimentionFormat": "NHWC"
+        }
+        self.new_ops.append(op)
+        self.base_model['tensorName'].append(output_name)
+        return output_index
+
+    def replace_input(self, origin_idx, new_idx):
+        for op in self.base_model['oplists']:
+            if op['type'] == 'ConvertTensor' and origin_idx in op['inputIndexes']:
+                op['inputIndexes'] = [new_idx]
+
+    def apply_lora(self, op):
+        names = op['name'].split('/')
+        tag = names[1].split('.')[1] + names[3]
+        lora_a, lora_b = self.get_lora(tag)
+        input_index = op['inputIndexes'][0]
+        outpt_index = op['outputIndexes'][0]
+        # lora_B @ lora_A @ x -> lora_B @ (lora_A @ x)
+        a_out = self.build_conv(input_index, f'{tag}_A', list(lora_a.shape), lora_a.flatten().tolist())
+        b_out = self.build_conv(a_out, f'{tag}_B', list(lora_b.shape), lora_b.flatten().tolist())
+        n_out = self.build_binary(0, [outpt_index, b_out], f'{tag}_add')
+        self.replace_input(outpt_index, n_out)
+
+    def apply(self, base_path, out):
+        self.base_model = json.load(open(base_path, 'rt'))
+        self.new_ops = []
+        for i in range(len(self.base_model['oplists'])):
+            op = self.base_model['oplists'][i]
+            self.new_ops.append(op)
+            if op['type'] == 'Convolution':
+                if self.has_lora(op['name']):
+                    self.apply_lora(op)
+        self.base_model['oplists'] = self.new_ops
+        with open(out, 'w', encoding='utf-8') as file:
+            json.dump(self.base_model, file, ensure_ascii=False, indent=4)
+        return out
+
+# Lora end
+
 # Export class
 
 # custom op start
@@ -1252,10 +1522,10 @@ class OnnxRebuilder:
                linear.out_features == oc and
                (linear.bias is not None) == has_bias)
         weight_name, bias_name = f'{name}_weight', f'{name}_bias'
-        weight = linear.weight.data.transpose(1, 0).flatten().numpy()
+        weight = linear.weight.data.transpose(1, 0).flatten().float().numpy()
         self.make_external(weight_name, weight, [ic, oc])
         if has_bias:
-            bias = linear.bias.data.flatten().numpy()
+            bias = linear.bias.data.flatten().float().numpy()
             self.make_external(bias_name, bias, [oc])
         return weight_name, bias_name
 
@@ -1290,17 +1560,18 @@ class OnnxRebuilder:
 class MNNConveter:
     def __init__(self, onnx_path, weight_ops, config):
         self.weight_ops = weight_ops
-        self.quant_block = config.quant_block
-        self.quant_bit = config.quant_bit
-        self.lm_quant_bit = config.lm_quant_bit
-        self.symmetric = config.symmetric
+        self.config = config
+        self.quant_block = config.args.quant_block
+        self.quant_bit = config.args.quant_bit
+        self.lm_quant_bit = config.args.lm_quant_bit
+        self.symmetric = config.args.sym
         self.mnn_weight_offset = 0
         self.onnx_model_path = onnx_path
         self.mnn_name = os.path.basename(onnx_path).replace('.onnx', '.mnn')
-        self.mnn_model_path = os.path.join(config.dst_path, self.mnn_name)
+        self.mnn_model_path = os.path.join(config.args.dst_path, self.mnn_name)
         self.mnn_weight_path = f'{self.mnn_model_path}.weight'
-        if os.path.exists(config.mnnconvert):
-            self.mnnconvert = config.mnnconvert
+        if os.path.exists(config.args.mnnconvert):
+            self.mnnconvert = config.args.mnnconvert
         else:
             self.mnnconvert = None
 
@@ -1369,6 +1640,20 @@ class MNNConveter:
         self.convert(convert_args)
         return mnn_path
 
+    def removeDupOps(self, mnn_path):
+        convert_args = [
+            '',
+            '-f',
+            'MNN',
+            '--modelFile',
+            str(mnn_path),
+            '--MNNModel',
+            str(mnn_path),
+            '--optimizeLevel=1'
+        ]
+        self.convert(convert_args)
+        return mnn_path
+
     def export(self, quant_bit = None, quant_block = None):
         if self.weight_ops is None:
             if quant_bit is None:
@@ -1391,65 +1676,95 @@ class MNNConveter:
             self.mnn2json(self.mnn_model_path, mnn_json)
             self.rebuild(mnn_json)
             self.json2mnn(mnn_json, self.mnn_model_path)
+            self.removeDupOps(self.mnn_model_path)
+            if self.config.args.gptq_path is not None:
+                self.apply_gptq(mnn_json)
+            if self.config.args.lora_path is not None and self.config.args.lora_split:
+                 self.export_lora(mnn_json)
 
-    @spinner_run(f'quant model weight to ')
+    @spinner_run(f'apply gptq to ')
+    def apply_gptq(self, mnn_json):
+        GPTQ(self.config.args.gptq_path).apply(mnn_json, self.mnn_weight_path)
+        return self.mnn_weight_path
+
+    @spinner_run(f'export split lora to ')
+    def export_lora(self, mnn_json):
+        lora_model = os.path.join(self.config.args.dst_path, 'lora.mnn')
+        lora_json = f'{lora_model}.json'
+        LoRA(self.config.args.lora_path).apply(mnn_json, lora_json)
+        self.json2mnn(lora_json, lora_model)
+        if os.path.exists(lora_json):
+            os.remove(lora_json)
+        return lora_model
+
+    @spinner_run(f'quant model weight to ', True)
     def rebuild(self, json_path):
-        self.mnn_weight = open(self.mnn_weight_path, 'wb')
         mnn_graph = json.load(open(json_path, 'rt'))
         new_ops = []
-        for op in mnn_graph['oplists']:
-            if op['type'] == 'Extra':
-                new_ops += self.rebuild_op(op, mnn_graph)
-            else:
-                new_ops.append(op)
+        with open(self.mnn_weight_path, 'wb') as self.mnn_weight:
+            for op in tqdm(mnn_graph['oplists'], 'Quant weights'):
+                if op['type'] == 'Extra':
+                    new_ops += self.rebuild_op(op, mnn_graph)
+                else:
+                    new_ops.append(op)
         mnn_graph['oplists'] = new_ops
         with open(json_path, 'w', encoding='utf-8') as file:
             json.dump(mnn_graph, file, ensure_ascii=False, indent=4)
         return self.mnn_weight_path
 
     def quant(self, weight, quant_bit, quant_block, symmetric):
-        weight = weight.numpy()
+        if torch.cuda.is_available():
+            weight = weight.cuda()
+        if torch.backends.mps.is_available():
+            weight = weight.to('mps')
         oc, ic = weight.shape
         if quant_block == 0:
             block_size = ic
         else:
             block_size = quant_block
+        while ic % block_size != 0:
+            block_size /= 2
+        block_size = int(block_size)
         block_num = ic // block_size
         weight = weight.reshape(oc, block_num, block_size)
         offset = 1 << (quant_bit - 1)
         clip_max = offset - 1
         if symmetric:
             clip_min = -clip_max
-            abs_max = np.max(np.abs(weight), axis=-1, keepdims=True)
+            abs_max, _ = torch.max(torch.abs(weight), axis=-1, keepdims=True)
             scale = abs_max / clip_max
-            q_weight = np.round(weight / scale)
-            q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
+            q_weight = torch.round(weight / scale)
+            q_weight = (torch.clamp(q_weight.flatten(), clip_min, clip_max) + offset).to(torch.uint8)
             alpha = scale.flatten()
         else:
             clip_min = -offset
-            max_val = np.max(weight, axis=-1, keepdims=True)
-            min_val = np.min(weight, axis=-1, keepdims=True)
+            max_val, _ = torch.max(weight, axis=-1, keepdims=True)
+            min_val, _ = torch.min(weight, axis=-1, keepdims=True)
             scale = (max_val - min_val) / (clip_max - clip_min)
 
-            import MNN
-            if MNN.version() <= '2.9.6':
-                q_weight = np.round((weight - min_val) / scale) + clip_min
-                zeros = min_val
-                aMin = clip_min
+            if self.config.args.awq:
+                q_weight = torch.round(weight / scale) - torch.round(min_val / scale) + clip_min
+                zeros =  (torch.round(min_val / scale) - clip_min) * scale
             else:
-                q_weight = np.round(weight / scale) - np.round(min_val / scale) + clip_min
-                zeros =  (np.round(min_val / scale) - clip_min) * scale
-                aMin = 1
-            q_weight = (np.clip(q_weight.flatten(), clip_min, clip_max) + offset).astype(np.uint8)
-            alpha = np.stack([zeros.flatten(), scale.flatten()], axis=-1).flatten()
+                q_weight = torch.round((weight - min_val) / scale) + clip_min
+                zeros =  min_val - scale * clip_min
+            q_weight = (torch.clamp(q_weight.flatten(), clip_min, clip_max) + offset).to(torch.uint8)
+            alpha = torch.stack([zeros.flatten(), scale.flatten()], axis=-1).flatten()
+
         q_weight = q_weight.reshape(-1, 2)
         if quant_bit == 4:
             q_weight = q_weight[:, 0] * 16 + q_weight[:, 1]
 
+        # support for `MNN >= 2.9.6`
+        clip_min = 1
 
-        return q_weight, alpha, aMin
+        if q_weight.device is not torch.device('cpu'):
+            return q_weight.cpu(), alpha.float().cpu(), clip_min
+        return q_weight, alpha.float(), clip_min
 
-    def write_npy(self, data):
+    def write_weight(self, data):
+        if isinstance(data, torch.Tensor):
+            data = data.numpy()
         return self.mnn_weight.write(data.tobytes())
 
     def write_header(self, ic, oc, quant_bit):
@@ -1457,39 +1772,39 @@ class MNNConveter:
         shape_dtype = np.int16
         if oc > 65535 or ic > 65535:
             shape_dtype = np.int32
-        dim_length = self.write_npy(np.array([oc, ic]).astype(shape_dtype))
+        dim_length = self.write_weight(np.array([oc, ic]).astype(shape_dtype))
         offset = 1 << (quant_bit - 1)
         weight_map = [i for i in range(-offset, offset)]
         if len(weight_map) == 256:
             weight_map.insert(0, 0)
         else:
             weight_map.insert(0, len(weight_map))
-        map_length = self.write_npy(np.array(weight_map, dtype=np.int8))
+        map_length = self.write_weight(np.array(weight_map, dtype=np.int8))
         header_length = dim_num + dim_length + map_length
         return header_length, shape_dtype == np.int32
 
     def build_weight(self, linear, quant_bit, quant_block, symmetric):
         ic, oc = linear.in_features, linear.out_features
         if quant_bit == 16:
-            half_weight = linear.weight.data.half().flatten().numpy()
-            weight_len = self.write_npy(half_weight)
-            alpha_len, q_min, shape_int32 = 0, 0, False
+            half_weight = linear.weight.data.flatten().half()
+            weight_len = self.write_weight(half_weight)
+            alpha_len, q_min, shape_int32, header_len = 0, 0, False, 0
         else:
             assert(quant_bit in (4, 8))
             q_weight, alpha, q_min = self.quant(linear.weight.data, quant_bit, quant_block, symmetric)
             header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
-            weight_len = self.write_npy(q_weight) + header_len
-            alpha_len = self.write_npy(alpha)
+            weight_len = self.write_weight(q_weight) + header_len
+            alpha_len = self.write_weight(alpha)
         if linear.bias is not None:
-            bias = linear.bias.data.flatten().numpy()
-            bias_length = self.write_npy(bias)
+            bias = linear.bias.data.flatten().float()
+            bias_length = self.write_weight(bias)
         else:
             bias_length = 0
             # bias = np.zeros([oc], dtype=np.float32)
-            # bias_length = self.write_npy(bias)
+            # bias_length = self.write_weight(bias)
         external = [self.mnn_weight_offset, weight_len, alpha_len, bias_length, 0]
         self.mnn_weight_offset += (weight_len + alpha_len + bias_length)
-        return external, q_min, shape_int32
+        return external, q_min, shape_int32, header_len
 
     def build_tensor(self, graph, tensor_name):
         tensor_idx = [len(graph['tensorName'])]
@@ -1537,9 +1852,15 @@ class MNNConveter:
                linear.out_features == oc and
                (linear.bias is not None) == has_bias)
 
-        quant_bit = self.lm_quant_bit if 'lm_head' in name else self.quant_bit
+        is_lm = 'lm_head' in name
+        quant_bit = self.lm_quant_bit if is_lm else self.quant_bit
         block_size = ic if self.quant_block == 0 else self.quant_block
-        external, q_min, shape_int32 = self.build_weight(linear, quant_bit, self.quant_block, self.symmetric)
+        external, q_min, shape_int32, header_len = self.build_weight(linear, quant_bit, self.quant_block, self.symmetric)
+        if is_lm and self.config.tie_word_embeddings:
+            weight_offset = external[0] + header_len
+            alpha_offset = external[0] + external[1]
+            alpha_size = external[2]
+            self.config.llm_config['tie_embeddings'] = [weight_offset, alpha_offset, alpha_size, quant_bit, self.quant_block]
 
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
@@ -1720,6 +2041,13 @@ class Attention(torch.nn.Module):
                     self.q_proj.bias.data = torch.zeros(split_sizes[0])
                     self.k_proj.bias.data = torch.zeros(split_sizes[1])
                     self.v_proj.bias.data = torch.zeros(split_sizes[2])
+            self.q_proj.weight.requires_grad = False
+            self.k_proj.weight.requires_grad = False
+            self.v_proj.weight.requires_grad = False
+            self.q_proj.bias.requires_grad = False
+            self.k_proj.bias.requires_grad = False
+            self.v_proj.bias.requires_grad = False
+
 
     def forward(
         self,
@@ -1805,11 +2133,11 @@ class Rotary(torch.nn.Module):
             self.rotary_dim = config.rotary_dim
         if self.model_type == 'chatglm':
             self.rotary_dim = config.head_dim // 2
+        self.theta = 1.0 / (self.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
 
     def forward(self, position_ids):
-        theta = 1.0 / (self.rope_theta ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim))
         position_ids = position_ids.float().reshape(-1, 1)
-        idx_theta = position_ids * theta
+        idx_theta = position_ids * self.theta
         rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)])
         if self.model_type != 'chatglm2':
             rotary_pos_emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
@@ -1855,6 +2183,22 @@ class Rotary(torch.nn.Module):
         x1 = (x1 * cos1) + (rotate_half(x1) * sin1)
         x2 = (x2 * cos2) + (rotate_half(x2) * sin2)
         return torch.cat((x1, x2), dim=-1)
+
+class VisionRotary(Rotary):
+    def __init__(self, config):
+        super().__init__(config)
+
+    # support [h_pos, w_pos]
+    def forward(self, position_ids):
+        # [2, patch_len, 1]
+        position_ids = position_ids.float().unsqueeze(-1)
+        idx_theta = position_ids * self.theta
+        # [patch_len, rotary_dim]
+        idx_theta = idx_theta.permute(1, 0, 2).reshape(-1, self.rotary_dim)
+        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)])
+        rotary_pos_emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        rotary_pos_emb = rotary_pos_emb.unsqueeze(2).unsqueeze(1)
+        return rotary_pos_emb
 
 class Decoder(torch.nn.Module):
     def __init__(self, decoder, layer_id, config):
@@ -1912,7 +2256,7 @@ class Decoder(torch.nn.Module):
             hidden_states = self.mlp(hidden_states)
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
-        elif cross_attention_mask is not None:
+        elif cross_attention_mask is not None and self.cross_decoder:
             hidden_states = residual + self.cross_attn_attn_gate.tanh() * hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1935,7 +2279,7 @@ class Lm(torch.nn.Module):
         self.final_layernorm = final_layernorm_
         self.lm = lm_
         self.hidden_size = config.hidden_size
-        self.ppl = config.ppl
+        self.ppl = config.args.ppl
 
     def forward(self, hidden_states):
         if not self.ppl:
@@ -1945,9 +2289,11 @@ class Lm(torch.nn.Module):
         m_logits = self.lm(hidden_states)
         return m_logits
 
+# visual start
 class Visual(torch.nn.Module):
     def __init__(self, visual, base):
         super().__init__()
+        self.model_type = base.model_type
         self.visual = visual.eval()
         self.embed_ = base.embed
         self.tokenizer = base.tokenizer
@@ -1979,6 +2325,9 @@ class Visual(torch.nn.Module):
         self.llm_config['image_mean'] = image_mean.tolist()
         self.llm_config['image_norm'] = image_norm.tolist()
 
+    def export(self, onnx_path):
+        raise NotImplementedError
+
     def load(self):
         raise NotImplementedError
 
@@ -2006,6 +2355,21 @@ class QwenVisual(Visual):
         self.llm_config['vision_end'] = self.tokenizer.img_end_id
         self.llm_config['image_pad'] = self.tokenizer.img_pad_id
 
+    def export(self, onnx_path):
+        input_images = torch.randn((1, 3, self.image_size, self.image_size))
+        onnx_model = f'{onnx_path}/visual.onnx'
+        torch.onnx.export(self, (input_images),
+                        onnx_model,
+                        input_names=['input_images'],
+                        output_names=['image_embeds'],
+                        dynamic_axes={
+                            "input_images": { 0: "size" },
+                        },
+                        do_constant_folding=True,
+                        verbose=False,
+                        opset_version=15)
+        return onnx_model
+
     def forward(self, images):
         return self.visual(images).transpose(1, 0)
 
@@ -2032,7 +2396,8 @@ class Qwen2Visual(Visual):
         self.temporal_patch_size = 2
         self.patch_size = 14
         self.merge_size = 2
-        self.image_size = 420
+        self.image_height = 420
+        self.image_width = 420
         self.image_embeds = None
         super().__init__(visual, base)
 
@@ -2040,10 +2405,37 @@ class Qwen2Visual(Visual):
         self.vision_start_id = self.config.vision_start_token_id
         self.vision_end_id = self.config.vision_end_token_id
         self.image_pad_id = self.config.image_token_id
-        self.llm_config['image_size'] = self.image_size
+        self.llm_config['image_size'] = self.image_height
         self.llm_config['vision_start'] = self.vision_start_id
         self.llm_config['vision_end'] = self.vision_end_id
         self.llm_config['image_pad'] = self.image_pad_id
+        # load model
+        config = self.visual.config
+        self.hidden_size = config.embed_dim
+        self.num_attention_heads = config.num_heads
+        self.num_key_value_heads = config.num_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.rope_theta = 10000.0
+        self.rotary_dim = self.head_dim // 2
+        self.rotary = VisionRotary(self)
+        self.model_map = {
+            'decoder': {
+                'self_attn': 'attn',
+                'mlp': 'mlp',
+                'input_layernorm': 'norm1',
+                'post_attention_layernorm': 'norm2'
+            },
+            'attention': {
+                'qkv_proj': 'qkv',
+                'o_proj': 'proj'
+            }
+        }
+        self.patch_embed = self.visual.patch_embed
+        self.blocks = []
+        for block in self.visual.blocks.children():
+            layer_id = len(self.blocks)
+            self.blocks.append(Decoder(block, layer_id, self))
+        self.merger = self.visual.merger
 
     def str_to_ids(self, prompt):
         if '<img>' in prompt and '</img>' in prompt:
@@ -2056,6 +2448,11 @@ class Qwen2Visual(Visual):
             for part in parts:
                 if re.match(pattern, part):
                     img_content = re.search(r'<img>(.*?)</img>', part).group(1)
+                    # find <hw></hw> in image_content
+                    match = re.search(r'<hw>(.*?)</hw>', img_content)
+                    img_content = img_content[:match.start()] + img_content[match.end():]
+                    hw = match.group(1).split(',')
+                    self.image_height, self.image_width = int(hw[0]), int(hw[1])
                     if img_content.startswith('http://') or img_content.startswith('https://'):
                         image_obj = Image.open(requests.get(img_content, stream=True).raw)
                     img_pad_len = self.img_process(image_obj)
@@ -2069,7 +2466,18 @@ class Qwen2Visual(Visual):
         input_ids = self.tokenizer(txt_prompt, return_tensors="pt")['input_ids']
         return input_ids
 
-    def forward(self, images):
+    def forward(self, flatten_patches, position_ids, attention_mask):
+        rotary_pos_emb = self.rotary(position_ids)
+        hidden_states = self.patch_embed(flatten_patches)
+        if rotary_pos_emb.dtype != hidden_states.dtype:
+            rotary_pos_emb = rotary_pos_emb.to(hidden_states.dtype)
+        for blk in self.blocks:
+            hidden_states, _ = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
+        image_embeds = self.merger(hidden_states)
+        image_embeds = image_embeds.unsqueeze(1)
+        return image_embeds
+
+    def images_forward(self, images):
         images = [images] * self.temporal_patch_size
         patches = torch.concat(images, axis=0)
         _, channel, height, width = patches.shape
@@ -2091,13 +2499,53 @@ class Qwen2Visual(Visual):
             grid_t * grid_h * grid_w, channel * self.temporal_patch_size * self.patch_size * self.patch_size
         )
         image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
-        image_embeds = self.visual(flatten_patches, image_grid_thw)
-        image_embeds = image_embeds.unsqueeze(1)
-        return image_embeds
+        pos_ids = []
+        for t, h, w in image_grid_thw:
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // self.merge_size,
+                self.merge_size,
+                w // self.merge_size,
+                self.merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
+            hpos_ids = hpos_ids.flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // self.merge_size,
+                self.merge_size,
+                w // self.merge_size,
+                self.merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
+            wpos_ids = wpos_ids.flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids]))
+        position_ids = torch.cat(pos_ids, dim=0)
+        seq_len = grid_t * grid_h * grid_w
+        attention_mask = torch.zeros([1, seq_len, seq_len], dtype=torch.float)
+        return self.forward(flatten_patches, position_ids, attention_mask)
+
+    def smart_resize(self, height: int, width: int, factor: int = 28, min_pixels: int = 56 * 56, max_pixels: int = 14 * 14 * 4 * 1280):
+        if height < factor or width < factor:
+            raise ValueError(f"height:{height} or width:{width} must be larger than factor:{factor}")
+        elif max(height, width) / min(height, width) > 200:
+            raise ValueError(
+                f"absolute aspect ratio must be smaller than 200, got {max(height, width) / min(height, width)}"
+            )
+        h_bar = round(height / factor) * factor
+        w_bar = round(width / factor) * factor
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            h_bar = math.floor(height / beta / factor) * factor
+            w_bar = math.floor(width / beta / factor) * factor
+        elif h_bar * w_bar < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            h_bar = math.ceil(height * beta / factor) * factor
+            w_bar = math.ceil(width * beta / factor) * factor
+        return h_bar, w_bar
 
     def img_process(self, image):
-        resized_height = self.image_size
-        resized_width = self.image_size
         from transformers.image_transforms import (
             convert_to_rgb,
             resize,
@@ -2113,6 +2561,7 @@ class Qwen2Visual(Visual):
         )
         image = convert_to_rgb(image)
         image = to_numpy_array(image)
+        resized_height, resized_width = self.smart_resize(self.image_height, self.image_width)
         format = infer_channel_dimension_format(image)
         resample = PILImageResampling.BICUBIC
         image = resize(image, size=(resized_height, resized_width), resample=resample, input_data_format=format)
@@ -2121,7 +2570,7 @@ class Qwen2Visual(Visual):
         image = np.expand_dims(image, [0])
         image = image.transpose(0, 3, 1, 2)
         image = torch.from_numpy(image)
-        self.image_embeds = self.forward(image)
+        self.image_embeds = self.images_forward(image)
         return self.image_embeds.shape[0]
 
     def embed(self, input_ids, images = None, videos = None):
@@ -2131,9 +2580,29 @@ class Qwen2Visual(Visual):
             input_embeds[image_mask] = self.image_embeds
         return input_embeds
 
+    def export(self, onnx_path):
+        patch = torch.randn([900, 1176])
+        posision_ids = torch.zeros([2, 900], dtype=torch.int32)
+        attention_mask = torch.zeros([1, 900, 900], dtype=torch.float)
+        onnx_model = f'{onnx_path}/visual.onnx'
+        torch.onnx.export(self, (patch, posision_ids, attention_mask),
+                        onnx_model,
+                        input_names=['patches', 'position_ids', 'attention_mask'],
+                        output_names=['image_embeds'],
+                        dynamic_axes={
+                            "patches": { 0: "size" },
+                            "position_ids": { 1: "size" },
+                            "attention_mask": { 1: "size", 2: "size" }
+                        },
+                        do_constant_folding=True,
+                        verbose=False,
+                        opset_version=15)
+        return onnx_model
+
 class MllamaVision(Visual):
     def __init__(self, visual, base):
         super().__init__(visual, base)
+        self.multi_modal_projector = base.multi_modal_projector
         self.image_objs = []
 
     def load(self):
@@ -2162,12 +2631,11 @@ class MllamaVision(Visual):
         input_ids = self.tokenizer(txt_prompt, return_tensors="pt")['input_ids']
         # image process
         for img in self.image_objs:
-            image_embeds = self.img_process(img)
-            print(image_embeds.shape)
-            pass
+            self.img_process(img)
         return input_ids
 
     def img_process(self, image):
+        self.image_size = 560
         resized_height = self.image_size
         resized_width = self.image_size
         from transformers.image_transforms import (
@@ -2194,19 +2662,164 @@ class MllamaVision(Visual):
         image = np.expand_dims(image, [0, 1, 2])
         pad_val = np.zeros_like(image)
         image = np.concatenate([image, pad_val, pad_val, pad_val], axis=2)
-        print(image.shape)
         image = torch.from_numpy(image)
-        image_embeds = self.forward(image)
-        print(image_embeds.shape)
-        return image_embeds
+        self.cross_attention_states = self.forward(image)
 
     def forward(self, images):
         aspect_ratio_ids = torch.tensor([[1]])
         aspect_ratio_mask = torch.tensor([[[1, 0, 0, 0]]])
-        return self.visual(images, aspect_ratio_ids, aspect_ratio_mask)
+        vision_outputs = self.visual(images, aspect_ratio_ids, aspect_ratio_mask)
+        cross_attention_states = vision_outputs[0]
+        cross_attention_states = cross_attention_states.type(self.multi_modal_projector.weight.dtype)
+        cross_attention_states = self.multi_modal_projector(cross_attention_states).reshape(
+                -1, cross_attention_states.shape[-2], self.hidden_size)
+        return cross_attention_states
 
     def embed(self, input_ids, images = None, videos = None):
-        return self.embed_(input_ids)
+        txt_embeds = self.embed_(input_ids)
+        return txt_embeds
+# visual end
+
+# audio start
+class Audio(torch.nn.Module):
+    def __init__(self, audio, base):
+        super().__init__()
+        self.audio = audio
+        self.embed_ = base.embed
+        self.tokenizer = base.tokenizer
+        self.config = base.config
+        self.hidden_size = base.hidden_size
+        self.llm_config = base.llm_config
+        self.quant_bit = 16
+        self.init_config()
+        self.load()
+
+    @staticmethod
+    def get_audio(model_type):
+        audio_models = {
+            'qwen2_audio': Qwen2Audio,
+        }
+        if model_type in audio_models:
+            return audio_models[model_type]
+        return None
+
+    def init_config(self):
+        self.llm_config['is_audio'] = True
+
+    def load(self):
+        raise NotImplementedError
+
+    def str_to_ids(self, prompt):
+        input_ids = self.tokenizer(prompt, return_tensors="pt")['input_ids']
+        return input_ids
+
+    def forward(self, images):
+        raise NotImplementedError
+
+    def embed(self, input_ids, images = None, videos = None):
+        raise NotImplementedError
+
+class Qwen2Audio(Audio):
+    def __init__(self, audio, base):
+        super().__init__(audio, base)
+        self.audio_embeds = None
+        self.audio_pad_id = 151646
+        self.n_fft = 400
+        self.sampling_rate = 16000
+        self.hop_length = 160
+        self.chunk_length = 30
+        self.feature_size = 128
+        self.n_samples = self.chunk_length * self.sampling_rate
+        self.max_length = self.n_samples // self.hop_length
+        from transformers.audio_utils import mel_filter_bank
+        self.mel_filters = mel_filter_bank(
+            num_frequency_bins=1 + self.n_fft // 2,
+            num_mel_filters=self.feature_size,
+            min_frequency=0.0,
+            max_frequency=8000.0,
+            sampling_rate=self.sampling_rate,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+
+    def load(self):
+        # model
+        self.audio_tower = self.audio.audio_tower
+        self.multi_modal_projector = self.audio.multi_modal_projector
+        # config
+        self.llm_config['is_audio'] = True
+
+    def str_to_ids(self, prompt):
+        if '<audio>' in prompt and '</audio>' in prompt:
+            import re
+            from io import BytesIO
+            from urllib.request import urlopen
+            import librosa
+            pattern = r'(<audio>.*?</audio>)'
+            parts = re.split(pattern, prompt)
+            txt_prompt = ''
+            for part in parts:
+                if re.match(pattern, part):
+                    audio_content = re.search(r'<audio>(.*?)</audio>', part).group(1)
+                    if audio_content.startswith('http://') or audio_content.startswith('https://'):
+                        audio_obj = librosa.load(BytesIO(urlopen(audio_content).read()), sr=self.sampling_rate)[0]
+                    audio_embed_len = self.audio_process(audio_obj)
+                    audio_pad_str = '<|AUDIO|>' * audio_embed_len
+                    txt_prompt += audio_pad_str
+                else:
+                    txt_prompt += part
+        else:
+            txt_prompt = prompt
+        input_ids = self.tokenizer(txt_prompt, return_tensors="pt")['input_ids']
+        return input_ids
+
+    def forward(self, input_features):
+        input_features = input_features.to(dtype=self.audio_tower.conv1.weight.dtype, device=self.audio_tower.conv1.weight.device)
+        inputs_embeds = torch.nn.functional.gelu(self.audio_tower.conv1(input_features))
+        inputs_embeds = torch.nn.functional.gelu(self.audio_tower.conv2(inputs_embeds))
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        _, seq_len, _ = inputs_embeds.shape
+        embed_pos = self.audio_tower.embed_positions.weight[:seq_len, :]
+        hidden_states = inputs_embeds + embed_pos
+        for encoder_layer in self.audio_tower.layers:
+            hidden_states = encoder_layer(hidden_states, None, None)[0]
+        hidden_states = hidden_states.permute(0, 2, 1)
+        hidden_states = self.audio_tower.avg_pooler(hidden_states)
+        hidden_states = hidden_states.permute(0, 2, 1)
+        hidden_states = self.audio_tower.layer_norm(hidden_states)
+        audio_features = self.multi_modal_projector(hidden_states)
+        return audio_features
+
+    def _torch_extract_fbank_features(self, waveform):
+        window = torch.hann_window(self.n_fft)
+        stft = torch.stft(waveform, self.n_fft, self.hop_length, window=window, return_complex=True)
+        magnitudes = stft[..., :-1].abs() ** 2
+        mel_filters = torch.from_numpy(self.mel_filters).type(torch.float32)
+        mel_spec = mel_filters.T @ magnitudes
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        if waveform.dim() == 2:
+            max_val = log_spec.max(dim=2, keepdim=True)[0].max(dim=1, keepdim=True)[0]
+            log_spec = torch.maximum(log_spec, max_val - 8.0)
+        else:
+            log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        return log_spec
+
+    def audio_process(self, audio_obj):
+        # audio_obj = np.pad(audio_obj, (0, self.n_samples - audio_obj.shape[0]))
+        waveform = torch.from_numpy(audio_obj).type(torch.float32)
+        input_features = self._torch_extract_fbank_features(waveform).unsqueeze(0)
+        audio_embeds = self.forward(input_features)
+        self.audio_embeds = audio_embeds.permute([1, 0, 2])
+        return self.audio_embeds.shape[0]
+
+    def embed(self, input_ids, images = None, videos = None):
+        input_embeds = self.embed_(input_ids)
+        if self.audio_embeds is not None:
+            audio_mask = (input_ids == self.audio_pad_id).squeeze()
+            input_embeds[audio_mask] = self.audio_embeds.type(input_embeds.dtype)
+        return input_embeds
+# audio end
 
 class LlmExporter(torch.nn.Module):
     '''
@@ -2219,59 +2832,53 @@ class LlmExporter(torch.nn.Module):
         self.load_model(args.path)
 
     def init_from_args(self, args):
+        self.args = args
         self.max_length = 128
         self.stop_ids = []
-        self.visual = None
         self.dst_name = 'llm'
         # load config from args
-        self.path = args.path
-        self.dst_path = args.dst_path
-        self.onnx_path = os.path.join(self.dst_path, 'onnx')
-        self.tokenizer_path = args.tokenizer_path
-        self.lora_path = args.lora_path
-        self.skip_slim = args.skip_slim
-        self.ppl = args.ppl
-        self.awq = args.awq
-        self.quant_bit = args.quant_bit
-        self.quant_block = args.quant_block
-        self.symmetric = args.sym
-        self.mnnconvert = args.mnnconvert
-        if self.tokenizer_path is None:
-            self.tokenizer_path = self.path
-        if args.lm_quant_bit is not None:
-            self.lm_quant_bit = args.lm_quant_bit
-        else:
-            self.lm_quant_bit = self.quant_bit
+        self.onnx_path = os.path.join(self.args.dst_path, 'onnx')
+        if self.args.tokenizer_path is None:
+            self.args.tokenizer_path = self.args.path
+        if args.lm_quant_bit is None:
+            self.args.lm_quant_bit = self.args.quant_bit
         # init export dst dir
-        if not os.path.exists(self.dst_path):
-            os.makedirs(self.dst_path)
+        if not os.path.exists(self.args.dst_path):
+            os.makedirs(self.args.dst_path)
         if not os.path.exists(self.onnx_path):
             os.makedirs(self.onnx_path)
 
     def load_pretrained(self, model_path: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path, trust_remote_code=True, use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.args.tokenizer_path, trust_remote_code=True, use_fast=False)
         if 'Qwen2-VL' in model_path:
             from transformers import Qwen2VLForConditionalGeneration
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_path).float().eval()
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_path, torch_dtype='auto').eval()
+        elif 'Qwen2-Audio' in model_path:
+            from transformers import Qwen2AudioForConditionalGeneration
+            self.audio = Qwen2AudioForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
+            self.model = self.audio.language_model
         elif 'Llama-3.2' in model_path and 'Vision' in model_path:
             from transformers import MllamaForConditionalGeneration
-            self.model = MllamaForConditionalGeneration.from_pretrained(model_path).float().eval()
+            self.model = MllamaForConditionalGeneration.from_pretrained(model_path, torch_dtype='auto').eval()
+        elif 'Llama' in model_path or 'Yi' in model_path:
+            from transformers import LlamaForCausalLM
+            self.model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype='auto', trust_remote_code=True).eval()
         else:
             try:
-                self.model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+                self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype='auto', trust_remote_code=True).eval()
             except:
-                self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
+                self.model = AutoModel.from_pretrained(model_path, torch_dtype='auto', trust_remote_code=True).eval()
         self.config = self.model.config
-        if self.lora_path is not None:
+        if self.args.lora_path is not None and not self.args.lora_split:
             from peft import PeftModel
-            adapter = PeftModel.from_pretrained(self.model, model_id=self.lora_path)
+            adapter = PeftModel.from_pretrained(self.model, model_id=self.args.lora_path)
             self.model = adapter.merge_and_unload(progressbar=True)
 
     @staticmethod
     def has_attr(obj, attr):
         return hasattr(obj, attr) and getattr(obj, attr) is not None
 
-    @spinner_run(f'load pretrained model ')
+    @spinner_run(f'load pretrained model ', True)
     def load_model(self, model_path):
         self.load_pretrained(model_path)
         self.attention_mask_type = 'float'
@@ -2279,9 +2886,12 @@ class LlmExporter(torch.nn.Module):
         self.stop_ids.append(self.tokenizer.eos_token_id)
         if hasattr(self.tokenizer, 'im_end_id'):
             self.stop_ids.append(self.tokenizer.im_end_id)
-        eot_id = self.tokenizer.encode('<|eot_id|>')
-        if len(eot_id) == 1:
-            self.stop_ids.append(eot_id[0])
+        try:
+            eot_id = self.tokenizer.encode('<|eot_id|>')
+            if len(eot_id) == 1:
+                self.stop_ids.append(eot_id[0])
+        except:
+            pass
         if hasattr(self.model, 'generation_config') and self.model.generation_config is not None:
             eos_token_id = self.model.generation_config.eos_token_id
             from collections.abc import Iterable
@@ -2292,9 +2902,22 @@ class LlmExporter(torch.nn.Module):
                     self.stop_ids.append(id)
         self.stop_ids = [stop_id for stop_id in self.stop_ids if stop_id is not None]
         self.stop_ids = list(set(self.stop_ids))
+        self.visual = None
         model_mapper = ModelMapper()
 
+        self.tie_word_embeddings = self.args.tie_embed and (hasattr(self.config, 'tie_word_embeddings') and self.config.tie_word_embeddings)
         self.model_type, self.model_map = model_mapper.get_map(self.config)
+
+        if self.args.awq:
+            self.model.float()
+        if self.args.export is not None:
+            # set norm's weight as float for export
+            def visit_module(module):
+                if not isinstance(module, torch.nn.Linear) and hasattr(module, 'weight'):
+                    module.float()
+                for name, child in module.named_children():
+                    visit_module(child)
+            visit_module(self.model)
         # print(self.config, self.model_type, self.model_map, self.model)
         # load config info
         ModelMapper.do_map(self, self.config, self.model_map['config'])
@@ -2339,6 +2962,12 @@ class LlmExporter(torch.nn.Module):
             out_features, in_features = self.embed_.weight.shape
             self.lm_ = torch.nn.Linear(in_features, out_features)
             self.lm_.weight = self.embed_.weight
+        elif not isinstance(self.lm_, torch.nn.Linear):
+            # for Baichuan2
+            weight = self.lm_.weight
+            out_features, in_features = weight.shape
+            self.lm_ = torch.nn.Linear(in_features, out_features)
+            self.lm_.weight = weight
 
         if self.embed_.weight is self.lm_.weight:
             import copy
@@ -2355,7 +2984,13 @@ class LlmExporter(torch.nn.Module):
         self.lm = Lm(self.lm_, self.final_layernorm_, self)
         # visual model
         if self.visual is not None:
+            if self.args.export is not None:
+                self.visual.float()
             self.visual = Visual.get_visual(self.model_type)(self.visual, self)
+        if hasattr(self, 'audio') and self.audio is not None:
+            self.audio = Audio.get_audio(self.audio.config.model_type)(self.audio, self)
+        else:
+            self.audio = None
         return model_path
 
     def get_attention_mask(self) -> torch.Tensor:
@@ -2394,9 +3029,14 @@ class LlmExporter(torch.nn.Module):
     def visual_embed(self, input_ids):
         return self.visual.embed(input_ids)
 
+    def audio_embed(self, input_ids):
+        return self.audio.embed(input_ids)
+
     def embedding(self, input_ids):
         if self.visual is not None and self.token_len == 0:
             input_embeds = self.visual_embed(input_ids)
+        elif self.audio is not None and self.token_len == 0:
+            input_embeds = self.audio_embed(input_ids)
         else:
             input_embeds = self.embed(input_ids)
         return input_embeds
@@ -2412,13 +3052,15 @@ class LlmExporter(torch.nn.Module):
         hidden_states = input_ids # llm forward without embedding
         presents = [None for i in range(self.num_hidden_layers)]
         rotary_pos_emb = self.rotary(position_ids)
+        if self.args.test and rotary_pos_emb.dtype != hidden_states.dtype:
+            rotary_pos_emb = rotary_pos_emb.type(hidden_states.dtype)
         for i in range(self.num_hidden_layers):
             if self.blocks[i].cross_decoder and cross_attention_states is None:
                 continue
             hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask, past_key_values[i])
             presents[i] = kv
         logits = self.lm(hidden_states)
-        if not self.ppl:
+        if not self.args.ppl:
             logits = logits.reshape(-1)
         if presents[0].shape == presents[-1].shape and None not in presents:
             presents = torch.stack(presents)
@@ -2429,66 +3071,71 @@ class LlmExporter(torch.nn.Module):
     # some test functions
     def build_prompt(self, query):
         # just for test
-        if 'Qwen2' in self.path or 'reader' in self.path:
+        if 'Qwen2' in self.args.path or 'QwQ' in self.args.path or 'reader' in self.args.path:
             return f'<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
-        if 'Qwen' in self.path:
+        if 'Qwen' in self.args.path:
             return f'\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
-        if 'Baichuan2' in self.path:
+        if 'Baichuan2' in self.args.path:
             return f'<reserved_106>{query}<reserved_107>'
-        if 'internlm' in self.path:
+        if 'internlm' in self.args.path:
             return f'<|User|>:{query}<eoh>\n<|Bot|>:'
-        if 'TinyLlama' in self.path:
+        if 'TinyLlama' in self.args.path:
             return f'<s><|system|>\nYou are a friendly chatbot who always responds in the style of a pirate</s>\n<|user|>\n{query}</s>\n<|assistant|>\n'
-        if 'Yi' in self.path:
+        if 'Yi' in self.args.path:
             return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
-        if 'deepseek' in self.path:
+        if 'deepseek' in self.args.path:
             return f'<|begin_of_sentence|>User: {query}\n\nAssistant:'
-        if 'Llama-3.1' in self.path:
+        if 'Llama-3.1' in self.args.path:
             return f'<|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
-        if 'Llama-3' in self.path:
+        if 'Llama-3' in self.args.path:
             return f'<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{query}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
-        if 'Llama-2' in self.path:
+        if 'Llama-2' in self.args.path:
             return f'[INST]{query}[/INST]'
-        if 'chatglm2' in self.path:
+        if 'chatglm2' in self.args.path:
             return f'[Round 1]\n\n问：{query}\n\n答：'
-        if 'chatglm3' in self.path or 'glm-4' in self.path:
+        if 'chatglm3' in self.args.path or 'glm-4' in self.args.path:
             return f'<|user|>\n{query}\n<|assistant|>\n'
-        if 'chatglm' in self.path:
+        if 'chatglm' in self.args.path:
             return f'{query}[gMASK]<sop>'
-        if 'phi-2' in self.path:
+        if 'phi-2' in self.args.path:
             return f'Instruct: {query}\nOutput:'
-        if 'gemma-2' in self.path:
+        if 'gemma-2' in self.args.path:
             return f'<bos><start_of_turn>user\n{query}<end_of_turn>\n<start_of_turn>model\n'
-        if 'OpenELM' in self.path:
+        if 'OpenELM' in self.args.path:
             return f'<s>{query}'
-        if 'SmolLM2' in self.path:
+        if 'SmolLM2' in self.args.path:
             return f'<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
         return query
 
     def str_to_ids(self, prompt):
         if self.visual is not None:
             return self.visual.str_to_ids(prompt)
+        if self.audio is not None:
+            return self.audio.str_to_ids(prompt)
         input_ids = self.tokenizer(prompt, return_tensors="pt")['input_ids']
         return input_ids
 
     def id_to_str(self, token_id):
-        def contains_replacement(text): return '\uFFFD' in text
-        def decode_id(token_id):
-            return self.tokenizer.convert_tokens_to_string(
-                    self.tokenizer._convert_id_to_token(int(token_id)))
-        def decode_ids(token_ids):
-            return self.tokenizer.convert_tokens_to_string(
-                    self.tokenizer.convert_ids_to_tokens(token_ids))
-        word = decode_id(int(token_id))
-        # Smollm tokenizer will produce half chinese character, using buffer to decode
-        if contains_replacement(word):
-            self.decode_buffer.append(token_id)
-            buffer_txt = decode_ids(self.decode_buffer)
-            if not contains_replacement(buffer_txt):
-                word = buffer_txt
-                self.decode_buffer.clear()
-            else:
-                word = ''
+        try:
+            word = self.tokenizer.decode(int(token_id))
+        except:
+            def contains_replacement(text): return '\uFFFD' in text
+            def decode_id(token_id):
+                return self.tokenizer.convert_tokens_to_string(
+                        self.tokenizer._convert_id_to_token(int(token_id)))
+            def decode_ids(token_ids):
+                return self.tokenizer.convert_tokens_to_string(
+                        self.tokenizer.convert_ids_to_tokens(token_ids))
+            word = decode_id(int(token_id))
+            # Smollm tokenizer will produce half chinese character, using buffer to decode
+            if contains_replacement(word):
+                self.decode_buffer.append(token_id)
+                buffer_txt = decode_ids(self.decode_buffer)
+                if not contains_replacement(buffer_txt):
+                    word = buffer_txt
+                    self.decode_buffer.clear()
+                else:
+                    word = ''
         return word
 
     def response(self, query):
@@ -2528,14 +3175,20 @@ class LlmExporter(torch.nn.Module):
     def export_visual(self):
         if self.visual is None:
             return
-        input_images = torch.randn((1, 3, self.visual.image_size, self.visual.image_size))
-        model = self.visual
-        onnx_model = f'{self.onnx_path}/visual.onnx'
-        torch.onnx.export(model, (input_images),
+        return self.visual.export(self.onnx_path)
+
+    @spinner_run(f'export audio to ')
+    def export_audio(self):
+        if self.audio is None:
+            return
+        input_features = torch.randn((1, self.audio.feature_size, self.audio.max_length))
+        model = self.audio.float()
+        onnx_model = f'{self.onnx_path}/audio.onnx'
+        torch.onnx.export(model, (input_features),
                         onnx_model,
-                        input_names=['input_images'],
-                        output_names=['image_embeds'],
-                        dynamic_axes={"input_images": {
+                        input_names=['input_features'],
+                        output_names=['audio_embeds'],
+                        dynamic_axes={"input_features": {
                             0: "size"
                         }},
                         do_constant_folding=True,
@@ -2553,19 +3206,19 @@ class LlmExporter(torch.nn.Module):
             tensor_data = self.embed.embed.weight.data.bfloat16()
         data_ptr = tensor_data.untyped_storage().data_ptr()
         buffer = (ctypes.c_byte * (tensor_data.numel() * 2)).from_address(data_ptr)
-        embedding_file = f'{self.dst_path}/embeddings_bf16.bin'
+        embedding_file = f'{self.args.dst_path}/embeddings_bf16.bin'
         with open(embedding_file, 'wb') as f:
             f.write(buffer)
         return embedding_file
 
     @spinner_run(f'export config to ')
     def export_config(self, mnn_config = False):
-        config_json = f'{self.dst_path}/llm_config.json'
+        config_json = f'{self.args.dst_path}/llm_config.json'
         with open(config_json, 'w', encoding='utf-8') as f:
             json.dump(self.llm_config, f, ensure_ascii=False, indent=4)
         if not mnn_config:
             return config_json
-        with open(f'{self.dst_path}/config.json', 'w', encoding='utf-8') as f:
+        with open(f'{self.args.dst_path}/config.json', 'w', encoding='utf-8') as f:
             config = {
                 "llm_model": f"{self.dst_name}.mnn",
                 "llm_weight": f"{self.dst_name}.mnn.weight",
@@ -2574,11 +3227,18 @@ class LlmExporter(torch.nn.Module):
                 "precision": "low",
                 "memory": "low"
             }
+            if self.visual is not None or self.audio is not None:
+                config['mllm'] = {
+                    'backend_type': "cpu",
+                    "thread_num": 4,
+                    "precision": "low",
+                    "memory": "low"
+                }
             json.dump(config, f, ensure_ascii=False, indent=4)
         return config_json
 
     def imitate_quant(self):
-        def quant_dequant(linear, quant_bit = self.quant_bit, quant_block = self.quant_block):
+        def quant_dequant(linear, quant_bit = self.args.quant_bit, quant_block = self.args.quant_block):
             weight = linear.weight.data
             oc, ic = weight.shape
             if quant_block == 0:
@@ -2634,7 +3294,7 @@ class LlmExporter(torch.nn.Module):
         return OnnxRebuilder(onnx_path, self.unloaded_ops).rebuild()
 
     @spinner_run(f'slim the graph of ')
-    def onnx_slim(self, onnx_model):
+    def slim_onnx(self, onnx_model):
         import onnxslim
         model = onnxslim.slim(onnx_model)
         onnx.save(model, onnx_model)
@@ -2674,35 +3334,50 @@ class LlmExporter(torch.nn.Module):
         self.is_awq_quantized = True
 
     def export(self, export_type):
-        if self.awq:
+        if self.args.awq:
             self.awq_quant()
         export_mnn = export_type == 'mnn'
         # export tokenizer
         self.export_tokenizer()
-        self.export_config(export_mnn)
-        self.export_embed()
+        if export_mnn and self.tie_word_embeddings:
+            pass # mnn tie_word_embeddings need't export embedding
+        else:
+            self.export_embed()
         if self.visual:
             visual_onnx = self.export_visual()
-            #if not self.skip_slim:
-                #visual_onnx = self.onnx_slim(visual_onnx)
             if export_mnn:
                 MNNConveter(visual_onnx, None, self).export(quant_bit=self.visual.quant_bit)
+        if self.audio:
+            audio_onnx = self.export_audio()
+            if export_mnn:
+                MNNConveter(audio_onnx, None, self).export(quant_bit=self.audio.quant_bit)
         # export graph to llm.onnx
         onnx_model = self.export_onnx()
-        if not self.skip_slim:
-            self.onnx_slim(onnx_model)
+        if self.args.onnx_slim:
+            self.slim_onnx(onnx_model)
         if export_mnn:
             # convert onnx to mnn and quant weight
             MNNConveter(onnx_model, self.unloaded_ops, self).export()
+            # delete onnx file
+            if os.path.exists(onnx_model):
+                try:
+                    for file in glob.glob(f'{self.onnx_path}/*'):
+                        os.remove(file)
+                    os.rmdir(self.onnx_path)
+                except Exception as e:
+                    print(f"remove onnx error: {e}")
         else:
             # export weight to llm.onnx.data
             self.onnx_load_param(onnx_model)
+        # export llm_config.json and config.json
+        self.export_config(export_mnn)
+
 
     @spinner_run(f'export tokenizer to ')
     def export_tokenizer(self):
         # load tokenizer file
-        tokenizer_model = os.path.join(self.tokenizer_path, 'tokenizer.model')
-        ice_text_model = os.path.join(self.tokenizer_path, 'ice_text.model')
+        tokenizer_model = os.path.join(self.args.tokenizer_path, 'tokenizer.model')
+        ice_text_model = os.path.join(self.args.tokenizer_path, 'ice_text.model')
         try:
             import sentencepiece as spm
             if os.path.exists(tokenizer_model):
@@ -2713,7 +3388,7 @@ class LlmExporter(torch.nn.Module):
                 self.sp_model = None
         except:
             self.sp_model = None
-        merge_file = os.path.join(self.path, 'merges.txt')
+        merge_file = os.path.join(self.args.path, 'merges.txt')
         if os.path.exists(merge_file):
             self.merge_txt = merge_file
         else:
@@ -2732,7 +3407,7 @@ class LlmExporter(torch.nn.Module):
             fp.write(f'{len(speicals)} {len(self.stop_ids)} {len(prefix)}\n')
             write_line(fp, speicals, self.stop_ids, prefix)
 
-        file_path = os.path.join(self.dst_path, "tokenizer.txt")
+        file_path = os.path.join(self.args.dst_path, "tokenizer.txt")
         special_list = list(self.tokenizer.added_tokens_decoder.keys())
         if hasattr(self.tokenizer, 'special_tokens'):
             for k, v in self.tokenizer.special_tokens.items():
@@ -2744,12 +3419,14 @@ class LlmExporter(torch.nn.Module):
         if hasattr(self.tokenizer, 'get_prefix_tokens'):
             prefix_list = self.tokenizer.get_prefix_tokens()
         if len(prefix_list) == 0:
-            test_txt = 'A'
-            ids = self.tokenizer.encode(test_txt)
-            get_txt = self.tokenizer.decode(ids[-1])
-            if len(ids) > 1 and get_txt == test_txt:
-                prefix_list += ids[:-1]
-                print(prefix_list)
+            try:
+                test_txt = 'A'
+                ids = self.tokenizer.encode(test_txt)
+                get_txt = self.tokenizer.decode(ids[-1])
+                if len(ids) > 1 and get_txt == test_txt:
+                    prefix_list += ids[:-1]
+            except:
+                pass
 
         if self.sp_model is not None:
             # senetencepiece
@@ -2767,7 +3444,7 @@ class LlmExporter(torch.nn.Module):
                     token_type = UNUSED
                 elif self.sp_model.IsByte(i):
                     token_type = BYTE
-                if self.path == 'Chatglm_6b':
+                if self.args.path == 'Chatglm_6b':
                     if '<n>' in token: token = '\n'
                     if '<|tab|>' in token: token = '\t'
                     if '<|blank_' in token: token = ' ' * int(token[8:token.find('|>')])
@@ -2978,8 +3655,8 @@ class EmbeddingExporter(LlmExporter):
         self.export_config(export_mnn)
         self.export_embed()
         onnx_model = self.export_onnx()
-        if not self.skip_slim:
-            self.onnx_slim(onnx_model)
+        if self.args.onnx_slim:
+            self.slim_onnx(onnx_model)
         if export_mnn:
             MNNConveter(onnx_model, None, self).export()
 
@@ -3001,7 +3678,7 @@ def export(path,
            lora_path = None,
            dst_path = './model',
            export = 'onnx',
-           skip_slim = False,
+           onnx_slim = False,
            quant_bit = 4,
            quant_block = 128,
            lm_quant_bit = None):
@@ -3012,7 +3689,7 @@ def export(path,
         'lora_path': lora_path,
         'dst_path': dst_path,
         'export': export,
-        'skip_slim': skip_slim,
+        'onnx_slim': onnx_slim,
         'quant_bit': quant_bit,
         'quant_block': quant_block,
         'lm_quant_bit': lm_quant_bit
@@ -3037,11 +3714,12 @@ def main():
                         )
     parser.add_argument('--tokenizer_path', type=str, default=None, help='tokenizer path, defaut is `None` mean using `--path` value.')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, defaut is `None` mean not apply lora.')
+    parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, defaut is `None` mean not apply gptq.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, defaut is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
     parser.add_argument('--export', type=str, default=None, help='export model to an onnx/mnn model.')
-    parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
+    parser.add_argument('--onnx_slim', action='store_true', help='Whether or not to use onnx-slim.')
     parser.add_argument('--quant_bit', type=int, default=4, help='mnn quant bit, 4 or 8, default is 4.')
     parser.add_argument('--quant_block', type=int, default=128, help='mnn quant block, default is 0 mean channle-wise.')
     parser.add_argument('--lm_quant_bit', type=int, default=None, help='mnn lm_head quant bit, 4 or 8, default is `quant_bit`.')
@@ -3049,7 +3727,8 @@ def main():
     parser.add_argument('--ppl', action='store_true', help='Whether or not to get all logits of input tokens.')
     parser.add_argument('--awq', action='store_true', help='Whether or not to use awq quant.')
     parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), defualt is False.')
-
+    parser.add_argument('--tie_embed', action='store_true', help='Whether or not to using tie_embedding, defualt is False.')
+    parser.add_argument('--lora_split', action='store_true', help='Whether or not export lora split, defualt is False.')
     args = parser.parse_args()
 
     model_path = args.path
