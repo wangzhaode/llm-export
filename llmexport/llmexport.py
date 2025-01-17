@@ -3227,7 +3227,8 @@ class LlmExporter(torch.nn.Module):
                 "precision": "low",
                 "memory": "low"
             }
-            if self.visual is not None or self.audio is not None:
+            if (hasattr(self, 'visual') and self.visual is not None) or \
+               (hasattr(self, 'audio') and self.audio is not None):
                 config['mllm'] = {
                     'backend_type': "cpu",
                     "thread_num": 4,
@@ -3588,9 +3589,9 @@ class EmbeddingExporter(LlmExporter):
     @spinner_run(f'load pretrained model ')
     def load_model(self, model_path):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        self.config = AutoConfig.from_pretrained(model_path)
+        self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         self.config._attn_implementation = 'eager'
-        self.model = AutoModel.from_config(self.config)
+        self.model = AutoModel.from_config(self.config, trust_remote_code=True)
         transformer = self.model.encoder
         self.model_type = self.config.model_type
         self.lm_ = self.model.pooler
