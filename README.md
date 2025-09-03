@@ -1,160 +1,208 @@
-# llm-export
+# LLM-Export
 
-[English](./README_en.md)
+[![PyPI version](https://badge.fury.io/py/llmexport.svg)](https://badge.fury.io/py/llmexport)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-380/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-llm-export是一个llm模型导出工具，能够将llm模型导出为onnx和mnn模型。
+[English](./README_en.md) | 中文
 
-- 🚀 优化原始代码，支持动态形状
-- 🚀 优化原始代码，减少常量部分
-- 🚀 使用[OnnxSlim](https://github.com/inisis/OnnxSlim)优化onnx模型，性能提升约5%; by [@inisis](https://github.com/inisis)
-- 🚀 支持将lora权重导出为onnx和mnn
-- 🚀 MNN推理代码[mnn-llm](https://github.com/wangzhaode/mnn-llm)
-- 🚀 Onnx推理代码[onnx-llm](https://github.com/wangzhaode/onnx-llm), [OnnxLLM](https://github.com/inisis/OnnxLLM)
+一个高效的大语言模型导出工具，能够将 LLM 模型导出为 ONNX 和 MNN 格式，支持量化优化和多模态模型。
 
-## 安装
-```sh
-# pip install
+## ✨ 主要特性
+
+- 🚀 **动态形状支持**：优化原始代码，支持动态输入形状
+- 🚀 **模型优化**：减少常量部分，提升推理性能
+- 🚀 **自动优化**：集成 [OnnxSlim](https://github.com/inisis/OnnxSlim) 优化 ONNX 模型，性能提升约 5% (感谢 [@inisis](https://github.com/inisis))
+- 🚀 **LoRA 支持**：支持 LoRA 权重的合并/分离导出
+- 🚀 **量化技术**：支持 AWQ、GPTQ、HQQ 等多种量化方法
+- 🚀 **多模态支持**：支持文本、图像、音频等多模态模型
+- 🚀 **推理框架**：提供 [MNN](https://github.com/wangzhaode/mnn-llm) 和 [ONNX](https://github.com/wangzhaode/onnx-llm) 推理代码
+
+## 📜 快速开始
+
+### 安装
+
+```bash
+# 从 PyPI 安装（推荐）
 pip install llmexport
 
-# git install
+# 从 GitHub 安装最新版本
 pip install git+https://github.com/wangzhaode/llm-export@master
 
-# local install
-git clone https://github.com/wangzhaode/llm-export && cd llm-export/
-pip install .
+# 本地开发安装
+git clone https://github.com/wangzhaode/llm-export
+cd llm-export
+pip install -e .
 ```
 
-## 用法
+### 基本用法
 
-1. 下载模型
-```sh
-git clone https://huggingface.co/Qwen/Qwen2-1.5B-Instruct
-# 如果huggingface下载慢可以使用modelscope
-git clone https://modelscope.cn/qwen/Qwen2-1.5B-Instruct.git
-```
-2. 测试模型
-```sh
-# 测试文本输入
-llmexport --path Qwen2-1.5B-Instruct --test "你好"
-# 测试图像文本
-llmexport --path Qwen2-VL-2B-Instruct  --test "<img>https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg</img>介绍一下图片里的内容"
+#### 1. 下载模型
+
+```bash
+# 使用 Hugging Face CLI
+huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct --local-dir Qwen2.5-1.5B-Instruct
+
+# 或使用 ModelScope（国内用户推荐）
+modelscope download Qwen/Qwen2.5-1.5B-Instruct --local_dir Qwen2.5-1.5B-Instruct
 ```
 
-3. 导出模型
-```sh
-# 将Qwen2-1.5B-Instruct导出为onnx模型
-llmexport --path Qwen2-1.5B-Instruct --export onnx
-# 将Qwen2-1.5B-Instruct导出为mnn模型, 量化参数为4bit, blokc-wise = 128
-llmexport --path Qwen2-1.5B-Instruct --export mnn --quant_bit 4 --quant_block 128
+#### 2. 模型测试
+
+```bash
+# 文本对话测试
+llmexport --path Qwen2.5-1.5B-Instruct --test "你好，请介绍一下你自己"
+
+# 多模态测试（图像+文本）
+llmexport --path Qwen2-VL-2B-Instruct --test "<img>image_url</img>描述一下这张图片"
 ```
 
-## 功能
-- 支持将模型为onnx或mnn模型，使用`--export onnx`或`--export mnn`
-- 支持对模型进行对话测试，使用`--test $query`会返回llm的回复内容
-- 默认会使用onnx-slim对onnx模型进行优化，跳过该步骤使用`--skip_slim`
-- 制定量化bit数使用`--quant_bit`；量化的block大小使用`--quant_block`
-- 使用`--lm_quant_bit`来制定lm_head层权重的量化bit数，不指定则使用`--quant_bit`的量化bit数
-- 支持使用自己编译的`MNNConvert`，使用`--mnnconvert`
-- 支持`awq`量化
-- 支持使用`GPTQ`量化的模型权重
-- 支持LoRA权重的合并/分离导出，使用`--lora_path`和`--lora_split`
+#### 3. 模型导出
 
-## 参数
-```
-usage: llmexport.py [-h] --path PATH [--type TYPE] [--tokenizer_path TOKENIZER_PATH] [--lora_path LORA_PATH] [--gptq_path GPTQ_PATH] [--dst_path DST_PATH]
-                    [--verbose] [--test TEST] [--export EXPORT] [--onnx_slim] [--quant_bit QUANT_BIT] [--quant_block QUANT_BLOCK] [--lm_quant_bit LM_QUANT_BIT]
-                    [--mnnconvert MNNCONVERT] [--ppl] [--awq] [--sym] [--tie_embed] [--lora_split]
+```bash
+# 导出为 ONNX 格式
+llmexport --path Qwen2.5-1.5B-Instruct --export onnx
 
-llm_exporter
+# 导出为 MNN 格式（默认 4bit 量化）
+llmexport --path Qwen2.5-1.5B-Instruct --export mnn
 
-options:
-  -h, --help            show this help message and exit
-  --path PATH           path(`str` or `os.PathLike`):
-                        Can be either:
-                        	- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]
-                        	- A path to a *directory* clone from repo like `../chatglm-6b`.
-  --type TYPE           type(`str`, *optional*):
-                        	The pretrain llm model type.
-  --tokenizer_path TOKENIZER_PATH
-                        tokenizer path, defaut is `None` mean using `--path` value.
-  --lora_path LORA_PATH
-                        lora path, defaut is `None` mean not apply lora.
-  --gptq_path GPTQ_PATH
-                        gptq path, defaut is `None` mean not apply gptq.
-  --dst_path DST_PATH   export onnx/mnn model to path, defaut is `./model`.
-  --verbose             Whether or not to print verbose.
-  --test TEST           test model inference with query `TEST`.
-  --export EXPORT       export model to an onnx/mnn model.
-  --onnx_slim           Whether or not to use onnx-slim.
-  --quant_bit QUANT_BIT
-                        mnn quant bit, 4 or 8, default is 4.
-  --quant_block QUANT_BLOCK
-                        mnn quant block, default is 0 mean channle-wise.
-  --lm_quant_bit LM_QUANT_BIT
-                        mnn lm_head quant bit, 4 or 8, default is `quant_bit`.
-  --mnnconvert MNNCONVERT
-                        local mnnconvert path, if invalid, using pymnn.
-  --ppl                 Whether or not to get all logits of input tokens.
-  --awq                 Whether or not to use awq quant.
-  --sym                 Whether or not to using symmetric quant (without zeropoint), defualt is False.
-  --tie_embed           Whether or not to using tie_embedding, defualt is False.
-  --lora_split          Whether or not export lora split, defualt is False.
+# 自定义量化参数
+llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 128
 ```
 
-## 模型下载
+## 🔧 高级功能
 
-|   Model  | ModelScope  | Hugging Face |
-| -------- | ----------- | ------------ |
-| [Qwen-VL-Chat](https://modelscope.cn/models/qwen/Qwen-VL-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen-VL-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen-VL-Chat-MNN) |
-| [Baichuan2-7B-Chat](https://modelscope.cn/models/baichuan-inc/Baichuan2-7B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Baichuan2-7B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Baichuan2-7B-Chat-MNN) |
-| [bge-large-zh](https://modelscope.cn/models/AI-ModelScope/bge-large-zh/summary) | [Q4_1](https://modelscope.cn/models/MNN/bge-large-zh-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/bge-large-zh-MNN) |
-| [chatglm-6b](https://modelscope.cn/models/ZhipuAI/ChatGLM-6B/summary) | [Q4_1](https://modelscope.cn/models/MNN/chatglm-6b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/chatglm-6b-MNN) |
-| [chatglm2-6b](https://modelscope.cn/models/ZhipuAI/chatglm2-6b/summary) | [Q4_1](https://modelscope.cn/models/MNN/chatglm2-6b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/chatglm2-6b-MNN) |
-| [chatglm3-6b](https://modelscope.cn/models/ZhipuAI/chatglm3-6b/summary) | [Q4_1](https://modelscope.cn/models/MNN/chatglm3-6b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/chatglm3-6b-MNN) |
-| [codegeex2-6b](https://modelscope.cn/models/ZhipuAI/codegeex2-6b/summary) | [Q4_1](https://modelscope.cn/models/MNN/codegeex2-6b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/codegeex2-6b-MNN) |
-| [deepseek-llm-7b-chat](https://modelscope.cn/models/deepseek-ai/deepseek-llm-7b-chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/deepseek-llm-7b-chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/deepseek-llm-7b-chat-MNN) |
-| [gemma-2-2b-it](https://modelscope.cn/models/llm-research/gemma-2-2b-it) | [Q4_1](https://modelscope.cn/models/MNN/gemma-2-2b-it-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/gemma-2-2b-it-MNN) |
-| [glm-4-9b-chat](https://modelscope.cn/models/ZhipuAI/glm-4-9b-chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/glm-4-9b-chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/glm-4-9b-chat-MNN) |
-| [gte_sentence-embedding_multilingual-base](https://modelscope.cn/models/iic/gte_sentence-embedding_multilingual-base/summary) | [Q4_1](https://modelscope.cn/models/MNN/gte_sentence-embedding_multilingual-base-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/gte_sentence-embedding_multilingual-base-MNN) |
-| [internlm-chat-7b](https://modelscope.cn/models/AI-ModelScope/internlm-chat-7b/summary) | [Q4_1](https://modelscope.cn/models/MNN/internlm-chat-7b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/internlm-chat-7b-MNN) |
-| [Llama-2-7b-chat](https://modelscope.cn/models/modelscope/Llama-2-7b-chat-ms/summary) | [Q4_1](https://modelscope.cn/models/MNN/Llama-2-7b-chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Llama-2-7b-chat-MNN) |
-| [Llama-3-8B-Instruct](https://modelscope.cn/models/modelscope/Meta-Llama-3-8B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Llama-3-8B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Llama-3-8B-Instruct-MNN) |
-| [Llama-3.2-1B-Instruct](https://modelscope.cn/models/LLM-Research/Llama-3.2-1B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Llama-3.2-1B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Llama-3.2-1B-Instruct-MNN) |
-| [Llama-3.2-3B-Instruct](https://modelscope.cn/models/LLM-Research/Llama-3.2-3B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Llama-3.2-3B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Llama-3.2-3B-Instruct-MNN) |
-| [OpenELM-1_1B-Instruct](https://huggingface.co/apple/OpenELM-1_1B-Instruct) | [Q4_1](https://modelscope.cn/models/MNN/OpenELM-1_1B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/OpenELM-1_1B-Instruct-MNN) |
-| [OpenELM-270M-Instruct](https://huggingface.co/apple/OpenELM-270M-Instruct) | [Q4_1](https://modelscope.cn/models/MNN/OpenELM-270M-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/OpenELM-270M-Instruct-MNN) |
-| [OpenELM-3B-Instruct](https://huggingface.co/apple/OpenELM-3B-Instruct) | [Q8_1](https://modelscope.cn/models/MNN/OpenELM-3B-Instruct-MNN) | [Q8_1](https://huggingface.co/taobao-mnn/OpenELM-3B-Instruct-MNN) |
-| [OpenELM-450M-Instruct](https://huggingface.co/apple/OpenELM-450M-Instruct) | [Q4_1](https://modelscope.cn/models/MNN/OpenELM-450M-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/OpenELM-450M-Instruct-MNN) |
-| [phi-2](https://modelscope.cn/models/mengzhao/phi-2/summary) | [Q4_1](https://modelscope.cn/models/MNN/phi-2-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/phi-2-MNN) |
-| [qwen/Qwen-1_8B-Chat](https://modelscope.cn/models/qwen/Qwen-1_8B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen-1_8B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen-1_8B-Chat-MNN) |
-| [Qwen-7B-Chat](https://modelscope.cn/models/qwen/Qwen-7B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen-7B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen-7B-Chat-MNN) |
-| [Qwen1.5-0.5B-Chat](https://modelscope.cn/models/qwen/Qwen1.5-0.5B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen1.5-0.5B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen1.5-0.5B-Chat-MNN) |
-| [Qwen1.5-1.8B-Chat](https://modelscope.cn/models/qwen/Qwen1.5-1.8B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen1.5-1.8B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen1.5-1.8B-Chat-MNN) |
-| [Qwen1.5-4B-Chat](https://modelscope.cn/models/qwen/Qwen1.5-4B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen1.5-4B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen1.5-4B-Chat-MNN) |
-| [Qwen1.5-7B-Chat](https://modelscope.cn/models/qwen/Qwen1.5-7B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen1.5-7B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen1.5-7B-Chat-MNN) |
-| [Qwen2-0.5B-Instruct](https://modelscope.cn/models/qwen/Qwen2-0.5B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2-0.5B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2-0.5B-Instruct-MNN) |
-| [Qwen2-1.5B-Instruct](https://modelscope.cn/models/qwen/Qwen2-1.5B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2-1.5B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2-1.5B-Instruct-MNN) |
-| [Qwen2-7B-Instruct](https://modelscope.cn/models/qwen/Qwen2-7B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2-7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2-7B-Instruct-MNN) |
-| [Qwen2-Audio-7B-Instruct](https://modelscope.cn/models/Qwen/Qwen2-Audio-7B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2-Audio-7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2-Audio-7B-Instruct-MNN) |
-| [Qwen2-VL-2B-Instruct](https://modelscope.cn/models/qwen/Qwen2-VL-2B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2-VL-2B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2-VL-2B-Instruct-MNN) |
-| [Qwen2-VL-7B-Instruct](https://modelscope.cn/models/qwen/Qwen2-VL-7B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2-VL-7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2-VL-7B-Instruct-MNN) |
-| [Qwen2.5-0.5B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-0.5B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-0.5B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-0.5B-Instruct-MNN) |
-| [Qwen2.5-1.5B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-1.5B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-1.5B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-1.5B-Instruct-MNN) |
-| [Qwen2.5-3B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-3B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-3B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-3B-Instruct-MNN) |
-| [Qwen2.5-7B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-7B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-7B-Instruct-MNN) |
-| [Qwen2.5-Coder-1.5B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-Coder-1.5B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-Coder-1.5B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-Coder-1.5B-Instruct-MNN) |
-| [Qwen2.5-Coder-7B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-Coder-7B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-Coder-7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-Coder-7B-Instruct-MNN) |
-| [Qwen2.5-Math-1.5B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-Math-1.5B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-Math-1.5B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-Math-1.5B-Instruct-MNN) |
-| [Qwen2.5-Math-7B-Instruct](https://modelscope.cn/models/qwen/Qwen2.5-Math-7B-Instruct/summary) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-Math-7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-Math-7B-Instruct-MNN) |
-| [QwQ-32B-Preview](https://modelscope.cn/models/Qwen/QwQ-32B-Preview/summary) | [Q4_1](https://modelscope.cn/models/MNN/QwQ-32B-Preview-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/QwQ-32B-Preview-MNN) |
-| [reader-lm-0.5b](https://huggingface.co/jinaai/reader-lm-0.5b) | [Q4_1](https://modelscope.cn/models/MNN/reader-lm-0.5b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/reader-lm-0.5b-MNN) |
-| [reader-lm-1.5b](https://huggingface.co/jinaai/reader-lm-1.5b) | [Q4_1](https://modelscope.cn/models/MNN/reader-lm-1.5b-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/reader-lm-1.5b-MNN) |
-| [TinyLlama-1.1B-Chat-v1.0](https://modelscope.cn/models/AI-ModelScope/TinyLlama-1.1B-Chat-v1.0/summary) | [Q4_1](https://modelscope.cn/models/MNN/TinyLlama-1.1B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/TinyLlama-1.1B-Chat-MNN) |
-| [Yi-6B-Chat](https://modelscope.cn/models/01ai/Yi-6B-Chat/summary) | [Q4_1](https://modelscope.cn/models/MNN/Yi-6B-Chat-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/Yi-6B-Chat-MNN) |
-| [MobileLLM-125M](https://huggingface.co/facebook/MobileLLM-125M) | [Q4_1](https://modelscope.cn/models/MNN/MobileLLM-125M-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/MobileLLM-125M-MNN) |
-| [MobileLLM-350M](https://huggingface.co/facebook/MobileLLM-350M) | [Q4_1](https://modelscope.cn/models/MNN/MobileLLM-350M-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/MobileLLM-350M-MNN) |
-| [MobileLLM-600M](https://huggingface.co/facebook/MobileLLM-600M) | [Q4_1](https://modelscope.cn/models/MNN/MobileLLM-600M-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/MobileLLM-600M-MNN) |
-| [MobileLLM-1B](https://huggingface.co/facebook/MobileLLM-1B) | [Q4_1](https://modelscope.cn/models/MNN/MobileLLM-1B-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/MobileLLM-1B-MNN) |
-| [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | [Q4_1](https://modelscope.cn/models/MNN/SmolLM2-135M-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/SmolLM2-135M-Instruct-MNN) |
-| [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | [Q4_1](https://modelscope.cn/models/MNN/SmolLM2-360M-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/SmolLM2-360M-Instruct-MNN) |
-| [SmolLM2-1.7B-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct) | [Q4_1](https://modelscope.cn/models/MNN/SmolLM2-1.7B-Instruct-MNN) | [Q4_1](https://huggingface.co/taobao-mnn/SmolLM2-1.7B-Instruct-MNN) |
+### 模型导出选项
+
+- **ONNX 导出**：使用 `--export onnx` 导出为 ONNX 格式
+- **MNN 导出**：使用 `--export mnn` 导出为 MNN 格式
+- **模型优化**：默认启用 OnnxSlim 优化，使用 `--onnx_slim` 显式启用
+
+### 量化配置
+
+- **量化位数**：`--quant_bit 4/8` （默认 4bit）
+- **量化块大小**：`--quant_block 64/128` （默认 64）
+- **LM Head 量化**：`--lm_quant_bit` 单独设置输出层量化
+- **对称量化**：`--sym` 启用对称量化（无零点）
+
+### 量化算法支持
+
+- **AWQ 量化**：`--awq` 启用 AWQ 量化
+- **HQQ 量化**：`--hqq` 启用 HQQ 量化
+- **GPTQ 量化**：`--gptq_path` 加载 GPTQ 量化模型
+- **Smooth 量化**：`--smooth` 启用 Smooth 量化
+
+### LoRA 支持
+
+- **LoRA 合并**：`--lora_path` 指定 LoRA 权重路径
+- **LoRA 分离**：`--lora_split` 分离导出 LoRA 权重
+
+### 多模态支持
+
+- **视觉量化**：`--visual_quant_bit`、`--visual_quant_block` 设置视觉模块量化
+- **视觉对称**：`--visual_sym` 视觉模块对称量化
+
+### 其他选项
+
+- **详细输出**：`--verbose` 显示详细日志
+- **性能评估**：`--ppl` 获取所有 token 的 logits
+- **自定义输出**：`--dst_path` 指定输出目录（默认 `./model`）
+
+## 📎 命令行参数
+
+### 基本参数
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--path` | 必需 | 模型路径，支持本地目录或 Hugging Face 模型 ID |
+| `--export` | 可选 | 导出格式：`onnx` 或 `mnn` |
+| `--test` | 可选 | 测试查询字符串 |
+| `--dst_path` | 可选 | 输出目录（默认 `./model`） |
+| `--verbose` | 开关 | 显示详细日志 |
+
+### 量化参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--quant_bit` | 4 | 量化位数（4 或 8） |
+| `--quant_block` | 64 | 量化块大小（0 表示通道级量化） |
+| `--lm_quant_bit` | 同 `quant_bit` | LM Head 层量化位数 |
+| `--visual_quant_bit` | 模型相关 | 视觉模块量化位数 |
+| `--visual_quant_block` | 模型相关 | 视觉模块量化块大小 |
+
+### 量化算法
+
+| 参数 | 说明 |
+|------|------|
+| `--awq` | 启用 AWQ 量化 |
+| `--hqq` | 启用 HQQ 量化 |
+| `--smooth` | 启用 Smooth 量化 |
+| `--sym` | 启用对称量化（无零点） |
+| `--visual_sym` | 视觉模块对称量化 |
+
+### LoRA 支持
+
+| 参数 | 说明 |
+|------|------|
+| `--lora_path` | LoRA 权重路径 |
+| `--lora_split` | 分离导出 LoRA 权重 |
+
+### 其他选项
+
+| 参数 | 说明 |
+|------|------|
+| `--tokenizer_path` | 分词器路径（默认使用 `--path`） |
+| `--gptq_path` | GPTQ 量化模型路径 |
+| `--mnnconvert` | 本地 MNNConvert 路径 |
+| `--onnx_slim` | 启用 ONNX-Slim 优化 |
+| `--ppl` | 获取所有 token 的 logits |
+| `--seperate_embed` | 分离嵌入层以避免量化 |
+| `--calib_data` | 校准数据路径 |
+
+## 📋 支持模型
+
+目前支持以下模型类型：
+
+### 文本模型
+- **Qwen 系列**：Qwen2.5、Qwen2、Qwen1.5、Qwen-VL 等
+- **LLaMA 系列**：Llama-3.2、Llama-3、Llama-2 等
+- **ChatGLM 系列**：ChatGLM4、ChatGLM3、ChatGLM2 等
+- **Baichuan 系列**：Baichuan2-7B-Chat 等
+- **Yi 系列**：Yi-6B-Chat 等
+- **其他**：InternLM、DeepSeek、Phi、Gemma、TinyLlama 等
+
+### 多模态模型
+- **视觉模型**：Qwen2-VL、Qwen2.5-VL、Llama-3.2-Vision、InternVL 等
+- **音频模型**：Qwen2-Audio、Qwen2.5-Omni 等
+
+### 嵌入模型
+- **文本嵌入**：bge-large-zh、gte-multilingual 等
+
+## 💾 模型下载
+
+我们提供了已经优化的模型下载：
+
+- **Hugging Face**：[taobao-mnn](https://huggingface.co/taobao-mnn)
+- **ModelScope**：[MNN](https://modelscope.cn/organization/MNN)
+
+部分热门模型：
+
+| 模型 | Hugging Face | ModelScope |
+|------|-------------|------------|
+| DeepSeek-R1-1.5B-Qwen | [Q4_1](https://huggingface.co/taobao-mnn/DeepSeek-R1-1.5B-Qwen-MNN) | [Q4_1](https://modelscope.cn/models/MNN/DeepSeek-R1-1.5B-Qwen-MNN) |
+| Qwen2.5-0.5B-Instruct | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-0.5B-Instruct-MNN) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-0.5B-Instruct-MNN) |
+| Qwen2.5-1.5B-Instruct | [Q4_1](https://huggingface.co/taobao-mnn/Qwen2.5-1.5B-Instruct-MNN) | [Q4_1](https://modelscope.cn/models/MNN/Qwen2.5-1.5B-Instruct-MNN) |
+| GPT-OSS-20B | [Q4_1](https://huggingface.co/taobao-mnn/gpt-oss-20b-MNN) | [Q4_1](https://modelscope.cn/models/MNN/gpt-oss-20b-MNN) |
+| Qwen3-4B-Instruct-2507 | [Q4_1](https://huggingface.co/taobao-mnn/Qwen3-4B-Instruct-2507-MNN) | [Q4_1](https://modelscope.cn/models/MNN/Qwen3-4B-Instruct-2507-MNN) |
+
+更多模型请查看完整列表。
+
+## 🔗 相关项目
+
+- **MNN 推理**：[mnn-llm](https://github.com/wangzhaode/mnn-llm) - MNN 框架的 LLM 推理库
+- **ONNX 推理**：[onnx-llm](https://github.com/wangzhaode/onnx-llm)、[OnnxLLM](https://github.com/inisis/OnnxLLM) - ONNX 格式推理库
+- **模型优化**：[OnnxSlim](https://github.com/inisis/OnnxSlim) - ONNX 模型优化工具
+
+## 📄 许可证
+
+本项目采用 [MIT 许可证](https://opensource.org/licenses/MIT)。
