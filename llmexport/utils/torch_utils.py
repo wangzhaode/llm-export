@@ -98,3 +98,15 @@ def quant(weight, quant_bit, quant_block, symmetric, awq, hqq):
     if q_weight.device is not torch.device('cpu'):
         return q_weight.cpu(), alpha.float().cpu()
     return q_weight, alpha.float()
+
+def onnx_export(model, inputs, onnx_model, input_names, output_names, dynamic_axes=None):
+    torch.onnx.export(
+            model, inputs,
+            onnx_model,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            do_constant_folding=True,
+            verbose=False,
+            dynamo=False,
+            opset_version=15)

@@ -14,7 +14,8 @@
 - 🚀 **模型优化**：减少常量部分，提升推理性能
 - 🚀 **自动优化**：集成 [OnnxSlim](https://github.com/inisis/OnnxSlim) 优化 ONNX 模型，性能提升约 5% (感谢 [@inisis](https://github.com/inisis))
 - 🚀 **LoRA 支持**：支持 LoRA 权重的合并/分离导出
-- 🚀 **量化技术**：支持 AWQ、GPTQ、HQQ 等多种量化方法
+- 🚀 **量化技术**：支持 AWQ、GPTQ、HQQ等多种量化方法
+- 🚀 **EAGLE 支持**：支持 EAGLE 推理加速技术
 - 🚀 **多模态支持**：支持文本、图像、音频等多模态模型
 - 🚀 **推理框架**：提供 [MNN](https://github.com/wangzhaode/mnn-llm) 和 [ONNX](https://github.com/wangzhaode/onnx-llm) 推理代码
 
@@ -68,6 +69,9 @@ llmexport --path Qwen2.5-1.5B-Instruct --export mnn
 
 # 自定义量化参数
 llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 128
+
+# 导出 EAGLE 模型
+llmexport --path Qwen2.5-1.5B-Instruct --export mnn --eagle_path path/to/eagle
 ```
 
 ## 🔧 高级功能
@@ -77,6 +81,7 @@ llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 
 - **ONNX 导出**：使用 `--export onnx` 导出为 ONNX 格式
 - **MNN 导出**：使用 `--export mnn` 导出为 MNN 格式
 - **模型优化**：默认启用 OnnxSlim 优化，使用 `--onnx_slim` 显式启用
+- **EAGLE 导出**：使用 `--eagle_path` 导出 EAGLE 加速模型
 
 ### 量化配置
 
@@ -107,6 +112,7 @@ llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 
 - **详细输出**：`--verbose` 显示详细日志
 - **性能评估**：`--ppl` 获取所有 token 的 logits
 - **自定义输出**：`--dst_path` 指定输出目录（默认 `./model`）
+- **EAGLE 支持**：`--eagle_path` 指定 EAGLE 模型路径
 
 ## 📎 命令行参数
 
@@ -147,6 +153,12 @@ llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 
 | `--lora_path` | LoRA 权重路径 |
 | `--lora_split` | 分离导出 LoRA 权重 |
 
+### EAGLE 支持
+
+| 参数 | 说明 |
+|------|------|
+| `--eagle_path` | EAGLE 模型路径 |
+
 ### 其他选项
 
 | 参数 | 说明 |
@@ -164,15 +176,15 @@ llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 
 目前支持以下模型类型：
 
 ### 文本模型
-- **Qwen 系列**：Qwen2.5、Qwen2、Qwen1.5、Qwen-VL 等
+- **Qwen 系列**：Qwen3、Qwen2.5、Qwen2、Qwen1.5、Qwen-VL 等
 - **LLaMA 系列**：Llama-3.2、Llama-3、Llama-2 等
 - **ChatGLM 系列**：ChatGLM4、ChatGLM3、ChatGLM2 等
 - **Baichuan 系列**：Baichuan2-7B-Chat 等
 - **Yi 系列**：Yi-6B-Chat 等
-- **其他**：InternLM、DeepSeek、Phi、Gemma、TinyLlama 等
+- **其他**：InternLM、DeepSeek、Phi、Gemma、TinyLlama、SmolLM 等
 
 ### 多模态模型
-- **视觉模型**：Qwen2-VL、Qwen2.5-VL、Llama-3.2-Vision、InternVL 等
+- **视觉模型**：Qwen2-VL、Qwen2.5-VL、Qwen3-VL、Llama-3.2-Vision、InternVL 等
 - **音频模型**：Qwen2-Audio、Qwen2.5-Omni 等
 
 ### 嵌入模型
@@ -205,4 +217,4 @@ llmexport --path Qwen2.5-1.5B-Instruct --export mnn --quant_bit 8 --quant_block 
 
 ## 📄 许可证
 
-本项目采用 [MIT 许可证](https://opensource.org/licenses/MIT)。
+本项目采用 [Apaache 2.0 许可证](./LICENSE)。
