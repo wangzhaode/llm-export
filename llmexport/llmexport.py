@@ -410,8 +410,9 @@ class LlmExporter(torch.nn.Module):
             self.talker.add_talker_embeds(talker_embeds)
 
         final_layernorm = hidden_states
+        logits_index_long = logits_index.to(torch.int64)
         if self.mtp is None:
-            hidden_states = hidden_states[:, logits_index:, :]
+            hidden_states = hidden_states[:, logits_index_long:, :]
             hidden_states = self.final_layernorm_(hidden_states)
             # default: set hidden_state before lm_head as output node
             final_layernorm = hidden_states
@@ -422,7 +423,7 @@ class LlmExporter(torch.nn.Module):
             hidden_states = self.final_layernorm_(hidden_states)
             if self.model_type == 'poi_qwen2_mtp':
                 final_layernorm = hidden_states # poi
-            hidden_states = hidden_states[:, logits_index:, :]
+            hidden_states = hidden_states[:, logits_index_long:, :]
         logits = self.lm(hidden_states)
         if presents[0].shape == presents[-1].shape and None not in presents:
             presents = torch.stack(presents)
