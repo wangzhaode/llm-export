@@ -16,16 +16,20 @@ class Vision(torch.nn.Module):
         self.quant_block = 128
         self.transformer_fuse = True
         self.group_conv_native = False
-        self.model_type = base.model_type
+        self.model_type = base.config.model_type
         self.visual = visual.eval()
-        self.embed_ = base.embed
+        # Store embed_ as a non-module attribute to prevent .float() from casting it
+        object.__setattr__(self, 'embed_', base.embed)
         self.tokenizer = base.tokenizer
-        self.config = base.config
-        self.hidden_size = base.hidden_size
-        self.llm_config = base.llm_config
+        self.config = base.config.origin_config
+        self.hidden_size = base.config.hidden_size
+        self.llm_config = { "is_visual": True }
         self.rope_ratio = 1.0
         self.init_config()
         self.load()
+
+    def get_config(self):
+        return self.llm_config
 
     @staticmethod
     def get_vision(model_type):
@@ -38,11 +42,16 @@ class Vision(torch.nn.Module):
             'qwen2_5_omni': Qwen2_5OmniVision,
             'qwen3_vl': Qwen3Vision,
             'qwen3_vl_moe': Qwen3Vision,
+            'qwen3_5': Qwen3_5Vision,
+            'qwen3_5_moe': Qwen3_5Vision,
             'gemma3': Gemma3Vision,
+            'gemma4': Gemma4Vision,
             'idefics3': Idefics3Vision,
             'smolvlm': Idefics3Vision,
             'llava_qwen2': MobileCLIPVision,
             'minicpmv': MiniCPMVision,
+            'glm_ocr': GlmOcrVision,
+            'lfm2_vl': Lfm2VlVision,
         }
         if model_type in visual_models:
             return visual_models[model_type]
@@ -72,7 +81,7 @@ class Vision(torch.nn.Module):
         raise NotImplementedError
 
     def embed(self, input_ids, images = None, videos = None):
-        raise NotImplementedError
+        return self.embed_(input_ids)
 
     def deepstacks(self):
         return None
@@ -124,8 +133,8 @@ class InternVLVision(Vision):
         super().__init__(visual, base)
         self.quant_bit = 8
         self.vision_model = visual
-        self.mlp1 = base.model.mlp1
-        self.select_layer = base.model.select_layer
+        self.mlp1 = visual.mlp1
+        self.select_layer = visual.select_layer
 
     def load(self):
         self.image_size = self.config.force_image_size
@@ -135,6 +144,7 @@ class InternVLVision(Vision):
         # self.llm_config['vision_start'] = self.tokenizer.img_start_id
         # self.llm_config['vision_end'] = self.tokenizer.img_end_id
         # self.llm_config['image_pad'] = self.tokenizer.img_pad_id
+
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.shape[0], x.shape[1], x.shape[2], x.shape[3]
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -146,6 +156,7 @@ class InternVLVision(Vision):
                    (c / (scale_factor * scale_factor)).int())
         x = x.permute(0, 2, 1, 3).contiguous()
         return x
+
     def extract_feature(self, pixel_values):
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
@@ -168,6 +179,7 @@ class InternVLVision(Vision):
         # For mnn's embedding, the order is (seq, batch, hidden)
         vit_embeds = vit_embeds.permute(1, 0, 2)
         return vit_embeds
+
     def init_config(self):
         self.llm_config['is_visual'] = True
         IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -178,6 +190,7 @@ class InternVLVision(Vision):
         self.llm_config['image_mean'] = IMAGENET_MEAN
         self.llm_config['image_norm'] = IMAGENET_STD
         self.llm_config['image_size_unit'] = 14
+
     def export(self, onnx_path):
         input_images = torch.randn((1, 3, self.image_size, self.image_size), dtype=torch.float32)
         onnx_model = f'{onnx_path}/visual.onnx'
@@ -189,6 +202,7 @@ class InternVLVision(Vision):
                         "input_images": { 0: "size", 2: "height", 3: "width"},
                     })
         return onnx_model
+
     def forward(self, images):
         return self.extract_feature(images)
 
@@ -425,7 +439,7 @@ class Qwen2Vision(Vision):
         if rotary_pos_emb.dtype != hidden_states.dtype:
             rotary_pos_emb = rotary_pos_emb.to(hidden_states.dtype)
         for blk in self.blocks:
-            hidden_states, _ = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
+            hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
         image_embeds = self.merger(hidden_states)
         image_embeds = image_embeds.unsqueeze(1)
         return image_embeds
@@ -500,6 +514,69 @@ class Qwen2Vision(Vision):
                     })
         return onnx_model
 
+class GlmOcrVision(Qwen2Vision):
+    def __init__(self, visual, base):
+        super().__init__(visual, base)
+
+    def load(self):
+        self.vision_start_id = self.config.image_start_token_id
+        self.vision_end_id = self.config.image_end_token_id
+        self.image_pad_id = self.config.image_token_id
+        self.llm_config['image_size'] = self.image_height
+        self.llm_config['vision_start'] = self.vision_start_id
+        self.llm_config['vision_end'] = self.vision_end_id
+        self.llm_config['image_pad'] = self.image_pad_id
+        self.vision_start_token = '<|begin_of_image|>'
+        self.vision_end_token = '<|end_of_image|>'
+        self.image_pad_token = '<|image|>'
+        # load model
+        config = self.visual.config
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_heads
+        self.num_key_value_heads = config.num_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.rope_theta = 10000.0
+        self.rotary_dim = self.head_dim // 2
+        self.rotary = VisionRotary(self)
+        self.model_map = {
+            'decoder': {
+                'self_attn': 'attn',
+                'mlp': 'mlp',
+                'input_layernorm': 'norm1',
+                'post_attention_layernorm': 'norm2'
+            },
+            'attention': {
+                'qkv_proj': 'qkv',
+                'o_proj': 'proj',
+                'q_norm': 'q_norm',
+                'k_norm': 'k_norm'
+            }
+        }
+        self.patch_embed = self.visual.patch_embed
+        self.post_layernorm = self.visual.post_layernorm
+        self.downsample = self.visual.downsample
+        self.blocks = []
+        for block in self.visual.blocks.children():
+            layer_id = len(self.blocks)
+            self.blocks.append(Decoder(block, layer_id, self))
+        self.merger = self.visual.merger
+
+    def forward(self, flatten_patches, position_ids, attention_mask):
+        rotary_pos_emb = self.rotary(position_ids)
+        hidden_states = self.patch_embed(flatten_patches)
+        if rotary_pos_emb.dtype != hidden_states.dtype:
+            rotary_pos_emb = rotary_pos_emb.to(hidden_states.dtype)
+        for blk in self.blocks:
+            hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
+        hidden_states = self.post_layernorm(hidden_states)
+        # downsample: reshape to [N, C, merge_size, merge_size] then Conv2D
+        hidden_states = hidden_states.view(-1, self.merge_size, self.merge_size, hidden_states.shape[-1])
+        hidden_states = hidden_states.permute(0, 3, 1, 2)
+        hidden_states = self.downsample(hidden_states).view(-1, self.visual.config.out_hidden_size)
+        image_embeds = self.merger(hidden_states)
+        image_embeds = image_embeds.unsqueeze(1)
+        return image_embeds
+
 class Gemma3Vision(Vision):
     def __init__(self, visual, base):
         # read from gemma3_map
@@ -546,6 +623,199 @@ class Gemma3Vision(Vision):
 
     def embed(self, input_ids):
         txt_embeds = self.embed_(input_ids)
+        return txt_embeds
+
+class Gemma4Vision(Vision):
+    def __init__(self, visual, base):
+        self.patch_size = base.config.origin_config.vision_config.patch_size
+        self.pooling_kernel_size = base.config.origin_config.vision_config.pooling_kernel_size
+        self.default_output_length = base.config.origin_config.vision_config.default_output_length
+        super().__init__(visual, base)
+        self.quant_bit = 8
+        self.image_tensors = []
+        self._vision_pad_positions = None
+        # visual is model.vision_tower (Gemma4VisionModel)
+        self.vision_tower = visual
+        # embed_vision is Gemma4MultimodalEmbedder (RMSNorm + Linear)
+        self.embed_vision = base.embed_vision.float()
+
+    def init_config(self):
+        # gemma4 uses rescale to [0,1], then model does 2*(x-0.5)
+        # MNN C++ does: pixel = (pixel - mean) * norm
+        # To get [0,1]: mean=0, norm=1/255
+        self.llm_config['is_visual'] = True
+        self.llm_config['image_mean'] = [0.0, 0.0, 0.0]
+        self.llm_config['image_norm'] = [1.0/255.0, 1.0/255.0, 1.0/255.0]
+        self.llm_config['vision_start'] = self.config.boi_token_id
+        self.llm_config['vision_end'] = self.config.eoi_token_id
+        self.llm_config['image_pad'] = self.config.image_token_id
+
+    def load(self):
+        self.llm_config['image_size'] = self.patch_size * int((self.default_output_length * self.pooling_kernel_size ** 2) ** 0.5)
+
+    def forward(self, pixel_values, image_position_ids):
+        # pixel_values: [batch, max_patches, patch_pixels]
+        # image_position_ids: [batch, max_patches, 2]
+        vt = self.vision_tower
+
+        # Manually run vision pipeline to avoid mask creation issues in ONNX trace
+        # 1. Patch embedding
+        padding_positions = (image_position_ids == -1).all(dim=-1)
+        inputs_embeds = vt.patch_embedder(pixel_values, image_position_ids, padding_positions)
+
+        # 2. Encoder: compute position embeddings and run layers
+        encoder = vt.encoder
+        attention_mask = (~padding_positions).unsqueeze(1).unsqueeze(2).float()
+        attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
+
+        hidden_states = inputs_embeds
+        position_embeddings = encoder.rotary_emb(hidden_states, image_position_ids)
+        for layer in encoder.layers:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                position_ids=image_position_ids,
+            )
+
+        # 3. Pooler: always output fixed max_soft_tokens (keep padding for ONNX compatibility)
+        pooling_kernel_size = vt.config.pooling_kernel_size
+        output_length = pixel_values.shape[1] // (pooling_kernel_size * pooling_kernel_size)
+        hidden_states, pooler_mask = vt.pooler(
+            hidden_states=hidden_states,
+            pixel_position_ids=image_position_ids,
+            padding_positions=padding_positions,
+            output_length=output_length,
+        )
+        if vt.config.standardize and hasattr(vt, 'std_bias'):
+            hidden_states = (hidden_states - vt.std_bias) * vt.std_scale
+
+        # 4. Apply multimodal embedder (norm + projection to text hidden_size)
+        # Output fixed size [batch, max_soft_tokens, text_hidden_size]
+        image_features = self.embed_vision(hidden_states)
+        return image_features
+
+    def export(self, onnx_path):
+        # Default: 280 soft tokens * 9 (pooling 3x3) = 2520 max patches
+        max_patches = self.default_output_length * self.pooling_kernel_size ** 2
+        patch_pixels = 3 * self.patch_size * self.patch_size  # 768
+        input_patches = torch.randn((1, max_patches, patch_pixels))
+        position_ids = torch.zeros((1, max_patches, 2), dtype=torch.long)
+        onnx_model = f'{onnx_path}/visual.onnx'
+        onnx_export(self, (input_patches, position_ids),
+                    onnx_model,
+                    input_names=['input_patches', 'image_position_ids'],
+                    output_names=['image_embeds'],
+                    dynamic_axes={
+                        "input_patches": {0: "batch", 1: "num_patches"},
+                        "image_position_ids": {0: "batch", 1: "num_patches"},
+                    })
+        return onnx_model
+
+    def str_to_ids(self, prompt):
+        import re
+        from PIL import Image
+        from io import BytesIO
+
+        self.image_tensors = []
+        self.image_positions = []
+
+        # Parse <img>...</img> tags
+        pattern = r'(<img>.*?</img>)'
+        parts = re.split(pattern, prompt)
+        txt_prompt = ''
+        for part in parts:
+            if re.match(pattern, part):
+                img_content = re.search(r'<img>(.*?)((?:<hw>.*?</hw>)?)</img>', part)
+                img_path = img_content.group(1) if img_content else ''
+                # Load and process image
+                if img_path.startswith('http'):
+                    from urllib.request import urlopen
+                    img = Image.open(BytesIO(urlopen(img_path).read())).convert('RGB')
+                else:
+                    img = Image.open(img_path).convert('RGB')
+                img_tensor, n_soft_tokens = self._preprocess_image(img)
+                self.image_tensors.append(img_tensor)
+                boi = self.tokenizer.decode([self.config.boi_token_id])
+                eoi = self.tokenizer.decode([self.config.eoi_token_id])
+                pad = self.tokenizer.decode([self.config.image_token_id])
+                txt_prompt += boi + pad * n_soft_tokens + eoi
+            else:
+                txt_prompt += part
+
+        input_ids = self.tokenizer(txt_prompt, return_tensors="pt", add_special_tokens=False)['input_ids']
+        return input_ids
+
+    def _preprocess_image(self, img):
+        """Preprocess PIL image to patches + position_ids."""
+        import numpy as np
+        ps = self.patch_size
+        pk = self.pooling_kernel_size
+        align = ps * pk
+        max_patches = self.default_output_length * pk * pk
+
+        # Resize preserving aspect ratio, aligned to ps*pk
+        w, h = img.size
+        ratio = min(1.0, (max_patches * ps * ps / (w * h)) ** 0.5)
+        new_w = max(align, round(w * ratio / align) * align)
+        new_h = max(align, round(h * ratio / align) * align)
+        while (new_w // ps) * (new_h // ps) > max_patches:
+            if new_h >= new_w: new_h -= align
+            else: new_w -= align
+
+        from PIL import Image as PILImage
+        img = img.resize((new_w, new_h), PILImage.BILINEAR)
+        pixels = np.array(img).astype(np.float32) / 255.0  # [0,1]
+        grid_h, grid_w = new_h // ps, new_w // ps
+        num_patches = grid_h * grid_w
+
+        # Patchify
+        patches = pixels.reshape(grid_h, ps, grid_w, ps, 3)
+        patches = patches.transpose(0, 2, 1, 3, 4).reshape(num_patches, -1)
+
+        # Position IDs
+        pos_ids = np.full((max_patches, 2), -1, dtype=np.int64)
+        for h_idx in range(grid_h):
+            for w_idx in range(grid_w):
+                pos_ids[h_idx * grid_w + w_idx] = [w_idx, h_idx]
+
+        # Pad patches
+        pad = np.zeros((max_patches - num_patches, ps*ps*3), dtype=np.float32)
+        patches = np.concatenate([patches, pad], axis=0)
+
+        actual_soft_tokens = num_patches // (self.pooling_kernel_size ** 2)
+        return (torch.from_numpy(patches).unsqueeze(0),
+                torch.from_numpy(pos_ids).unsqueeze(0)), actual_soft_tokens
+
+    def embed(self, input_ids):
+        if not self.image_tensors:
+            return self.embed_(input_ids)
+
+        # Get text embeddings
+        txt_embeds = self.embed_(input_ids)
+
+        # Store vision info for model.forward() to handle scale_emb correctly
+        pad_id = self.config.image_token_id
+        vis_idx = 0
+        for img_data in self.image_tensors:
+            patches, pos_ids = img_data
+            with torch.no_grad():
+                vis_embeds = self.forward(patches.float(), pos_ids)  # [1, 280, 1536]
+
+            # Find pad token positions and replace
+            pad_mask = (input_ids[0] == pad_id)
+            pad_indices = pad_mask.nonzero(as_tuple=True)[0]
+
+            # Pre-divide by scale_emb: model.forward() will multiply ALL positions by scale_emb,
+            # so dividing here ensures vision embeds restore to original after the multiply.
+            embed_scale = self.hidden_size ** 0.5
+            n = len(pad_indices)
+            if n > 0 and vis_embeds.shape[1] >= n:
+                for j in range(n):
+                    idx = pad_indices[j].item()
+                    txt_embeds[idx, 0, :] = vis_embeds[0, j, :] / embed_scale
+
+        self.image_tensors = []
         return txt_embeds
 
 class Qwen2_5Vision(Qwen2Vision):
@@ -621,7 +891,7 @@ class Qwen2_5Vision(Qwen2Vision):
                 attention_mask_now = attention_mask[0]
             else:
                 attention_mask_now = attention_mask[1]
-            hidden_states, _ = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask_now)
+            hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask_now)
         image_embeds = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
         image_embeds = image_embeds[reverse_indices, :]
@@ -721,6 +991,24 @@ class Qwen3Vision(Qwen2Vision):
         self.pos_embed = visual.pos_embed
         self.deepstack_merger_list = visual.deepstack_merger_list
 
+        # --- 修改点 1: 将 Patch_Embed 从 Conv3d 转换为 Linear ---
+        if hasattr(visual.patch_embed, 'proj'):
+            old_conv = visual.patch_embed.proj  # 重点：访问 .proj
+        else:
+            old_conv = visual.patch_embed       # 备选方案，防止某些版本结构不同
+        
+        out_channels, in_channels, kD, kH, kW = old_conv.weight.shape
+        in_features = in_channels * kD * kH * kW # 1536
+        
+        # 创建新的线性层
+        self.patch_embed = nn.Linear(in_features, out_channels)
+        
+        # 复制并转换权重 (C,D,H,W 展开顺序与 view(-1) 一致)
+        with torch.no_grad():
+            self.patch_embed.weight.copy_(old_conv.weight.view(out_channels, -1))
+            if old_conv.bias is not None:
+                self.patch_embed.bias.copy_(old_conv.bias)
+
         # deepstack
         self.deepstack_feature_list = []
         self.deepstack_embeds = None
@@ -805,7 +1093,11 @@ class Qwen3Vision(Qwen2Vision):
 
     def forward(self, flatten_patches, position_ids, attention_mask, idx_tensor, weight_tensor):
         rotary_pos_emb = self.rotary(position_ids)
-        hidden_states = self.patch_embed(flatten_patches)
+        # --- 修改点 2: 使用线性层处理输入 ---
+        # 无论输入是 5D [B,3,2,16,16] 还是 2D [B,1536]，view 都能将其安全转为 2D
+        x = flatten_patches.view(flatten_patches.size(0), -1)
+        hidden_states = self.patch_embed(x) # 输出: [B, 1024]
+        # ------------------------------------
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(2)
         pos_embeds = torch.sum(pos_embeds, 0, False)
         hidden_states = hidden_states + pos_embeds
@@ -813,7 +1105,7 @@ class Qwen3Vision(Qwen2Vision):
             rotary_pos_emb = rotary_pos_emb.to(hidden_states.dtype)
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states, _ = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
+            hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
                     hidden_states
@@ -845,6 +1137,144 @@ class Qwen3Vision(Qwen2Vision):
                     })
         return onnx_model
 
+class Qwen3_5Vision(Qwen2Vision):
+    def __init__(self, visual, base):
+        super().__init__(visual, base)
+        self.patch_size = 16
+        self.image_height = 480
+        self.image_width = 480
+
+        self.image_height = 256
+        self.image_width = 256
+
+        self.min_pixels = 65536
+        self.max_pixels = 16777216
+        self.merge_unit = self.merge_size * self.merge_size
+        self.num_grid_per_side = visual.num_grid_per_side
+        self.pos_embed = visual.pos_embed
+        self.norm_mean = self.norm_std = [0.5, 0.5, 0.5]
+        image_mean = np.array(self.norm_mean) * 255.0
+        image_norm = 1 / (np.array(self.norm_std) * 255.0)
+        self.llm_config['image_mean'] = image_mean.tolist()
+        self.llm_config['image_norm'] = image_norm.tolist()
+        self.llm_config['num_grid_per_side'] = self.num_grid_per_side
+        self.llm_config['has_deepstack'] = True
+        # --- 修改点 1: 将 Patch_Embed 从 Conv3d 转换为 Linear ---
+        if hasattr(visual.patch_embed, 'proj'):
+            old_conv = visual.patch_embed.proj  # 重点：访问 .proj
+        else:
+            old_conv = visual.patch_embed       # 备选方案，防止某些版本结构不同
+        
+        out_channels, in_channels, kD, kH, kW = old_conv.weight.shape
+        in_features = in_channels * kD * kH * kW 
+        
+        # 创建新的线性层
+        self.patch_embed = nn.Linear(in_features, out_channels)
+        
+        # 复制并转换权重 (C,D,H,W 展开顺序与 view(-1) 一致)
+        with torch.no_grad():
+            self.patch_embed.weight.copy_(old_conv.weight.view(out_channels, -1))
+            if old_conv.bias is not None:
+                self.patch_embed.bias.copy_(old_conv.bias)
+
+    def get_idx_weight(self, grid_thw):
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
+
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
+        weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device)
+        merge_size = self.merge_size
+        idx_tensor = idx_tensor.repeat(1, t)
+        idx_tensor = idx_tensor.view(4, t, h // merge_size, merge_size, w // merge_size, merge_size).permute(0, 1, 2, 4, 3, 5).reshape(4, -1)
+        weight_tensor = weight_tensor.repeat(1, t)
+        weight_tensor = weight_tensor.view(4, t, h // merge_size, merge_size, w // merge_size, merge_size).permute(0, 1, 2, 4, 3, 5).reshape(4, -1)
+        return idx_tensor, weight_tensor
+
+    def embed(self, input_ids, images = None, videos = None):
+        input_embeds = self.embed_(input_ids)
+        if self.image_embeds is not None and len(self.image_embeds) > 0:
+            image_mask = (input_ids == self.image_pad_id).squeeze()
+            input_embeds[image_mask] = torch.concat(self.image_embeds, dim=0).to(input_embeds.dtype)
+        return input_embeds
+
+    def images_forward(self, images):
+        flatten_patches, grid_thw = self.vision_reshape(images)
+        idx_tensor, weight_tensor = self.get_idx_weight(grid_thw)
+        position_ids = self.vision_position_ids(grid_thw)
+        attention_mask = self.vision_attention_mask(grid_thw)
+        image_embeds = self.forward(flatten_patches, position_ids, attention_mask, idx_tensor, weight_tensor)
+        return image_embeds
+
+    def forward(self, flatten_patches, position_ids, attention_mask, idx_tensor, weight_tensor):
+        rotary_pos_emb = self.rotary(position_ids)
+        x = flatten_patches.view(flatten_patches.size(0), -1)
+        hidden_states = self.patch_embed(x)
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor.unsqueeze(2)
+        pos_embeds = torch.sum(pos_embeds, 0, False)
+        hidden_states = hidden_states + pos_embeds
+        if rotary_pos_emb.dtype != hidden_states.dtype:
+            rotary_pos_emb = rotary_pos_emb.to(hidden_states.dtype)
+        for _, blk in enumerate(self.blocks):
+            hidden_states = blk(hidden_states, rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
+        image_embeds = self.merger(hidden_states)
+        image_embeds = image_embeds.unsqueeze(1)
+        return image_embeds
+
+    @spinner_run(f'export visual to ')
+    def export(self, onnx_path):
+        patch = torch.randn([256, 1536])
+        posision_ids = torch.zeros([2, 256], dtype=torch.int32)
+        attention_mask = torch.zeros([1, 256, 256], dtype=torch.float)
+        idx_tensor = torch.zeros([4, 256], dtype=torch.int32)
+        weight_tensor = torch.randn([4, 256])
+        onnx_model = f'{onnx_path}/visual.onnx'
+        onnx_export(self, (patch, posision_ids, attention_mask, idx_tensor, weight_tensor),
+                    onnx_model,
+                    input_names=['patches', 'position_ids', 'attention_mask', 'idx_tensor', 'weight_tensor'],
+                    output_names=['image_embeds'],
+                    dynamic_axes={
+                        "patches": { 0: "size" },
+                        "position_ids": { 1: "size" },
+                        "attention_mask": { 1: "size", 2: "size" },
+                        "idx_tensor": { 1: "size" },
+                        "weight_tensor": { 1: "size" }
+                    })
+        return onnx_model
+
+
 # SmolVLM & SmolVLM2
 class Idefics3Vision(Vision):
     def __init__(self, visual, base):
@@ -856,8 +1286,8 @@ class Idefics3Vision(Vision):
         self.image_mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         self.image_norm = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         super().__init__(visual, base)
-        self.connector = base.model.model.connector.float()
         self.visual = self.visual.float()
+        self.connector = self.visual.connector.float()
         self.quant_bit = 8
         self.transformer_fuse = False
 
@@ -1040,7 +1470,7 @@ class MobileCLIPVision(QwenVision):
     def __init__(self, visual, base):
         super().__init__(visual, base)
         self.visual = visual.float()
-        self.mm_projector = base.model.model.mm_projector.float()
+        self.mm_projector = self.visual.mm_projector.float()
         self.quant_bit = 8
         self.group_conv_native = False
 
@@ -1087,7 +1517,7 @@ class MiniCPMVision(Vision):
         self.encoder = self.visual.encoder
         self.post_layernorm = self.visual.post_layernorm
         # rebuild resampler
-        self.resampler = base.model.resampler.float()
+        self.resampler = self.visual.resampler.float()
         attrs = ['query', 'kv_proj', 'ln_kv', 'ln_q', 'attn', 'ln_post', 'proj', 'pos_embed', 'embed_dim']
         for attr in attrs:
             setattr(self, attr, getattr(self.resampler, attr))
@@ -1109,13 +1539,13 @@ class MiniCPMVision(Vision):
         self.vision_id_end_token = '</image_id>'
         self.vision_slice_start_token = '<slice>'
         self.vision_slice_end_token = '</slice>'
-        self.vision_start_id = self.tokenizer.encode(self.vision_start_token)[1]
-        self.vision_end_id = self.tokenizer.encode(self.vision_end_token)[1]
-        self.image_pad_id = self.tokenizer.encode(self.image_pad_token)[1]
-        self.vision_id_start_id = self.tokenizer.encode(self.vision_id_start_token)[1]
-        self.vision_id_end_id = self.tokenizer.encode(self.vision_id_end_token)[1]
-        self.vision_slice_start_id = self.tokenizer.encode(self.vision_slice_start_token)[1]
-        self.vision_slice_end_id = self.tokenizer.encode(self.vision_slice_end_token)[1]
+        self.vision_start_id = self.tokenizer.encode(self.vision_start_token)[-1]
+        self.vision_end_id = self.tokenizer.encode(self.vision_end_token)[-1]
+        self.image_pad_id = self.tokenizer.encode(self.image_pad_token)[-1]
+        self.vision_id_start_id = self.tokenizer.encode(self.vision_id_start_token)[-1]
+        self.vision_id_end_id = self.tokenizer.encode(self.vision_id_end_token)[-1]
+        self.vision_slice_start_id = self.tokenizer.encode(self.vision_slice_start_token)[-1]
+        self.vision_slice_end_id = self.tokenizer.encode(self.vision_slice_end_token)[-1]
         self.llm_config['image_size_unit'] = self.patch_size
         self.llm_config['image_size'] = self.image_size
         # self.llm_config['image_max_size'] = self.image_max_size
@@ -1388,5 +1818,197 @@ class MiniCPMVision(Vision):
                         "position_ids": { 0: "num", 1: "size" },
                         "attention_mask": { 0: "num", 1: "size" },
                         "tgt_sizes": { 0: "num" }
+                    })
+        return onnx_model
+
+# LFM2-VL (SigLIP2 vision encoder + pixel_unshuffle projector)
+class Lfm2VlVision(Vision):
+    def __init__(self, visual, base):
+        self.tile_size = base.config.origin_config.tile_size if hasattr(base.config.origin_config, 'tile_size') else 512
+        self.encoder_patch_size = base.config.origin_config.encoder_patch_size if hasattr(base.config.origin_config, 'encoder_patch_size') else 16
+        self.downsample_factor = base.config.origin_config.downsample_factor if hasattr(base.config.origin_config, 'downsample_factor') else 2
+        self.image_embeds = []
+        self.image_mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        self.image_norm = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        super().__init__(visual, base)
+        self.visual = self.visual.float()
+        self.quant_bit = 8
+        self.transformer_fuse = False
+        self.multi_modal_projector = base.multi_modal_projector.float()
+
+    def load(self):
+        self.image_token = '<image>'
+        self.image_start_token = '<|image_start|>'
+        self.image_end_token = '<|image_end|>'
+        self.image_thumbnail_token = '<|img_thumbnail|>'
+        self.image_pad_id = self.tokenizer.encode(self.image_token, add_special_tokens=False)[0]
+        self.vision_start_id = self.tokenizer.encode(self.image_start_token, add_special_tokens=False)[0]
+        self.vision_end_id = self.tokenizer.encode(self.image_end_token, add_special_tokens=False)[0]
+        self.global_image_id = self.tokenizer.encode(self.image_thumbnail_token, add_special_tokens=False)[0]
+        # tokens per tile: (tile_size / patch_size / downsample_factor)^2
+        patches_per_side = self.tile_size // self.encoder_patch_size // self.downsample_factor
+        self.tokens_per_tile = patches_per_side * patches_per_side
+        self.llm_config['image_size_unit'] = self.tile_size
+        self.llm_config['image_size'] = self.tile_size
+        self.llm_config['image_max_size'] = self.tile_size * 10  # max_tiles * tile_size
+        self.llm_config['vision_start'] = self.vision_start_id
+        self.llm_config['vision_end'] = self.vision_end_id
+        self.llm_config['image_pad'] = self.image_pad_id
+        self.llm_config['global_image'] = self.global_image_id
+        # load vision model components
+        self.vision_model = self.visual.vision_model
+        self.patch_embedding = self.vision_model.embeddings.patch_embedding
+        self.position_embedding = self.vision_model.embeddings.position_embedding
+        self.encoder = self.vision_model.encoder
+        self.post_layernorm = self.vision_model.post_layernorm
+        # position embedding base size
+        self.pos_embed_size = int(self.position_embedding.weight.shape[0] ** 0.5)
+
+    def init_config(self):
+        self.llm_config['is_visual'] = True
+        image_mean = self.image_mean * 255.0
+        image_norm = 1 / (self.image_norm * 255.0)
+        self.llm_config['image_mean'] = image_mean.tolist()
+        self.llm_config['image_norm'] = image_norm.tolist()
+
+    def pixel_unshuffle(self, hidden_states, h_patches, w_patches):
+        # hidden_states: (batch, h_patches * w_patches, hidden_dim)
+        batch_size = hidden_states.shape[0]
+        hidden_dim = hidden_states.shape[-1]
+        factor = self.downsample_factor
+        # reshape to spatial grid
+        x = hidden_states.reshape(batch_size, h_patches, w_patches, hidden_dim)
+        # pixel unshuffle: merge factor x factor patches
+        x = x.reshape(batch_size, h_patches, w_patches // factor, hidden_dim * factor)
+        x = x.permute(0, 2, 1, 3)
+        x = x.reshape(batch_size, w_patches // factor, h_patches // factor, hidden_dim * factor * factor)
+        x = x.permute(0, 2, 1, 3)
+        # flatten back: (batch, (h/f)*(w/f), hidden*f*f)
+        out_h = h_patches // factor
+        out_w = w_patches // factor
+        x = x.reshape(batch_size, out_h * out_w, hidden_dim * factor * factor)
+        return x
+
+    def patchify(self, pixel_values):
+        # pixel_values: (batch, 3, H, W)
+        batch, channels, height, width = pixel_values.shape
+        p = self.encoder_patch_size
+        h_patches = height // p
+        w_patches = width // p
+        # reshape to patches: (batch, h_patches, w_patches, channels * p * p)
+        x = pixel_values.reshape(batch, channels, h_patches, p, w_patches, p)
+        x = x.permute(0, 2, 4, 3, 5, 1)  # (batch, h, w, p, p, c)
+        x = x.reshape(batch, h_patches * w_patches, channels * p * p)
+        return x, h_patches, w_patches
+
+    def resize_position_embedding(self, h_patches, w_patches):
+        # Interpolate from (pos_embed_size, pos_embed_size) to (h_patches, w_patches)
+        pos_embed = self.position_embedding.weight  # (num_pos, hidden)
+        hidden_dim = pos_embed.shape[-1]
+        pos_2d = pos_embed.reshape(self.pos_embed_size, self.pos_embed_size, hidden_dim)
+        # (h, w, d) -> (1, d, h, w)
+        pos_2d = pos_2d.permute(2, 0, 1).unsqueeze(0).float()
+        resized = F.interpolate(pos_2d, size=(h_patches, w_patches),
+                                mode='bilinear', align_corners=False)
+        # (1, d, h, w) -> (h*w, d)
+        resized = resized.squeeze(0).permute(1, 2, 0).reshape(h_patches * w_patches, hidden_dim)
+        return resized.to(self.position_embedding.weight.dtype)
+
+    def forward(self, pixel_values):
+        # pixel_values: (batch, 3, tile_size, tile_size) - raw images
+        patches, h_patches, w_patches = self.patchify(pixel_values)
+        # patch embedding (Linear)
+        patch_embeds = self.patch_embedding(patches)
+        # position embedding (interpolated)
+        pos_embed = self.resize_position_embedding(h_patches, w_patches)
+        embeddings = patch_embeds + pos_embed.unsqueeze(0)
+        # encoder (no attention mask for fixed-size tiles)
+        encoder_output = self.encoder(embeddings)[0]
+        last_hidden_state = self.post_layernorm(encoder_output)
+        # pixel_unshuffle + projector
+        unshuffled = self.pixel_unshuffle(last_hidden_state, h_patches, w_patches)
+        # projector: LayerNorm -> Linear -> GELU -> Linear
+        image_features = self.multi_modal_projector.layer_norm(unshuffled)
+        image_features = self.multi_modal_projector.linear_1(image_features)
+        image_features = self.multi_modal_projector.act(image_features)
+        image_features = self.multi_modal_projector.linear_2(image_features)
+        # output shape: (batch, tokens_per_tile, 1, hidden_size) for MNN
+        image_features = image_features.unsqueeze(2)
+        return image_features
+
+    def str_to_ids(self, prompt):
+        if '<img>' in prompt and '</img>' in prompt:
+            import re
+            import requests
+            from PIL import Image
+            pattern = r'(<img>.*?</img>)'
+            parts = re.split(pattern, prompt)
+            txt_prompt = ''
+            for part in parts:
+                if re.match(pattern, part):
+                    img_content = re.search(r'<img>(.*?)</img>', part).group(1)
+                    if img_content.startswith('http://') or img_content.startswith('https://'):
+                        image_obj = Image.open(requests.get(img_content, stream=True).raw)
+                    else:
+                        image_obj = Image.open(img_content)
+                    img_pad_len = self.img_process(image_obj)
+                    txt_prompt += self.image_start_token
+                    txt_prompt += self.image_token * img_pad_len
+                    txt_prompt += self.image_end_token
+                else:
+                    txt_prompt += part
+        else:
+            txt_prompt = prompt
+        input_ids = self.tokenizer(txt_prompt, return_tensors="pt")['input_ids']
+        return input_ids
+
+    def img_process(self, image):
+        from transformers.image_transforms import (
+            convert_to_rgb, resize, rescale, normalize
+        )
+        from transformers.image_utils import (
+            PILImageResampling, infer_channel_dimension_format, to_numpy_array
+        )
+        image = convert_to_rgb(image)
+        image = to_numpy_array(image)
+        format = infer_channel_dimension_format(image)
+        resample = PILImageResampling.BILINEAR
+
+        def preprocess(img, target_h, target_w):
+            img = resize(img, size=(target_h, target_w), resample=resample, input_data_format=format)
+            img = rescale(img, scale=1 / 255.0, input_data_format=format)
+            img = normalize(image=img, mean=self.image_mean, std=self.image_norm, input_data_format=format)
+            img = np.expand_dims(img, [0])
+            img = img.transpose(0, 3, 1, 2)
+            return torch.from_numpy(img)
+
+        # Resize image to tile_size x tile_size and process
+        processed = preprocess(image, self.tile_size, self.tile_size)
+        with torch.no_grad():
+            image_embed = self.forward(processed)
+        # image_embed shape: (1, tokens_per_tile, 1, hidden_size)
+        num_tokens = image_embed.shape[1]
+        hidden_size = image_embed.shape[3]
+        self.image_embeds.append(image_embed.reshape(-1, 1, hidden_size))
+        return num_tokens
+
+    def embed(self, input_ids, images=None, videos=None):
+        input_embeds = self.embed_(input_ids)
+        if self.image_embeds is not None and len(self.image_embeds) > 0:
+            image_mask = (input_ids == self.image_pad_id).squeeze()
+            image_features = torch.concat(self.image_embeds, dim=0).to(input_embeds.dtype)
+            input_embeds[image_mask] = image_features
+        return input_embeds
+
+    @spinner_run(f'export visual to ')
+    def export(self, onnx_path):
+        pixel_values = torch.randn([1, 3, self.tile_size, self.tile_size])
+        onnx_model = f'{onnx_path}/visual.onnx'
+        onnx_export(self, (pixel_values),
+                    onnx_model,
+                    input_names=['pixel_values'],
+                    output_names=['image_embeds'],
+                    dynamic_axes={
+                        "pixel_values": { 0: "size" },
                     })
         return onnx_model

@@ -5,7 +5,7 @@ import numpy
 import json
 import argparse
 
-from .utils.mnn_utils import *
+from utils.mnn_utils import *
 
 class TokenContent:
     def __init__(self):
@@ -494,7 +494,7 @@ def convert(args):
     os.remove(dst_json)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='gguf2mnn', formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description='gguf2mnn', formatter_class=argparse.RawTextHelpFormatter)    
     parser.add_argument('--gguf', type=str, required=True,help='src gguf model')
     parser.add_argument('--mnn_dir', type=str, required=True,help='mnn llm dir')
     parser.add_argument('--load_token', type=bool, default = False, help='Override tokenizer.txt from gguf')

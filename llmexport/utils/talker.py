@@ -10,14 +10,14 @@ from .torch_utils import onnx_export
 class Talker(torch.nn.Module):
     def __init__(self, talker, token2wav, base):
         super().__init__()
-        self.model_type = base.model_type
+        self.model_type = base.config.model_type
         self.thinker_embed = base.embed
         self.args = base.args
         self.talker = talker.float()
         self.token2wav = Qwen2_5OmniToken2Wav(token2wav, base)
         self.config = base.config
-        self.hidden_size = base.hidden_size
-        self.llm_config = base.llm_config
+        self.hidden_size = base.config.hidden_size
+        self.llm_config = { 'has_talker': True }
         self.rope_ratio = 1.0
         self.quant_bit = 4
         if self.hidden_size <= 2048:
@@ -25,6 +25,9 @@ class Talker(torch.nn.Module):
             self.quant_bit = 8
         self.init_config()
         self.load()
+
+    def get_config(self):
+        return self.llm_config
 
     @staticmethod
     def get_talker(model_type):
@@ -36,7 +39,7 @@ class Talker(torch.nn.Module):
         return None
 
     def init_config(self):
-        self.llm_config['has_talker'] = True
+        pass
 
     def load(self):
         raise NotImplementedError
@@ -50,7 +53,7 @@ class Talker(torch.nn.Module):
     def add_generate_ids(self, token_id):
         raise NotImplementedError
 
-    def forward(self, inputs_embeds, attention_mask, position_ids, past_key_values = None):
+    def forward(self, inputs_embeds, attention_mask, position_ids):
         raise NotImplementedError
 
     def export(self, onnx_path):
@@ -87,7 +90,7 @@ class OmniRotary(Rotary):
 class Qwen2_5OmniTalker(Talker):
     def __init__(self, talker, token2wav, base):
         super().__init__(talker, token2wav, base)
-        self.input_hidden_size = base.hidden_size
+        self.input_hidden_size = base.config.hidden_size
         self.seq_len = 0
         self.token_len = 0
         self.talker_embeds = []
@@ -101,6 +104,7 @@ class Qwen2_5OmniTalker(Talker):
                 'num_attention_heads': 'num_attention_heads',
                 'num_hidden_layers': 'num_hidden_layers',
                 'num_key_value_heads': 'num_key_value_heads',
+                'rope_parameters': 'rope_parameters',
                 'rope_theta': 'rope_theta',
                 'rope_scaling': 'rope_scaling'
             },
@@ -114,33 +118,35 @@ class Qwen2_5OmniTalker(Talker):
                 'q_proj': 'q_proj',
                 'k_proj': 'k_proj',
                 'v_proj': 'v_proj',
-                'o_proj': 'o_proj'
+                'o_proj': 'o_proj',
             }
         }
         ModelMapper.do_map(self, self.talker.config, self.model_map['config'])
         self.mrope_section = self.rope_scaling['mrope_section']
+        if self.rope_theta is None and 'rope_theta' in self.rope_parameters:
+            self.rope_theta = self.rope_parameters['rope_theta']
         self.embed = self.talker.model.embed_tokens
         self.rotary = OmniRotary(self)
         # self.rotary = Rotary(self)
         self.blocks = []
         for block in self.talker.model.layers:
             layer_id = len(self.blocks)
-            self.blocks.append(Decoder(block, layer_id, self))
+            decoder = Decoder(block, layer_id, self)
+            decoder.self_attn.export_fused_attn = True
+            self.blocks.append(decoder)
 
-    def forward(self, inputs_embeds, attention_mask, position_ids, past_key_values = None):
+
+    def forward(self, inputs_embeds, attention_mask, position_ids):
         hidden_states = self.talker.thinker_to_talker_proj(inputs_embeds)
         rotary_pos_emb = self.rotary(position_ids)
-        presents = [None for i in range(self.num_hidden_layers)]
 
         for i in range(self.num_hidden_layers):
-            hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask, past_key_values[i])
-            presents[i] = kv
+            hidden_states = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask)
 
         hidden_states = hidden_states[:, -1, :]
         hidden_states = self.talker.model.norm(hidden_states)
         logits = self.talker.codec_head(hidden_states)
-        presents = torch.stack(presents)
-        return logits, presents
+        return logits
 
     def get_position_ids(self) -> torch.Tensor:
         if self.token_len:
@@ -182,7 +188,6 @@ class Qwen2_5OmniTalker(Talker):
 
         _, self.seq_len, _ = talker_inputs_embeds.shape
         _, reply_len, _ = thinker_reply_part.shape
-        past_key_values = [None for i in range(self.num_hidden_layers)]
 
         inputs_embeds = talker_inputs_embeds.float()
         self.token_len = 0
@@ -198,10 +203,9 @@ class Qwen2_5OmniTalker(Talker):
                     inputs_embeds = inputs_embeds + thinker_reply_part[:, self.token_len - 1, :]
                 else:
                     inputs_embeds = inputs_embeds + thinker_reply_part[:, -1, :]
-            logits, past_key_values = self.forward(inputs_embeds=inputs_embeds,
-                                                    attention_mask=attention_mask,
-                                                    position_ids=position_ids,
-                                                    past_key_values=past_key_values)
+            logits = self.forward(inputs_embeds=inputs_embeds,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids)
             token_id = torch.argmax(logits)
             self.token_len += 1
             self.seq_len += 1
@@ -229,16 +233,14 @@ class Qwen2_5OmniTalker(Talker):
         inputs_embeds = torch.randn([1, self.seq_len, self.input_hidden_size])
         posision_ids = self.get_position_ids()
         attention_mask = self.get_attention_mask()
-        past_key_values = torch.zeros([self.num_hidden_layers, 2, 1, 0, self.num_key_value_heads, self.head_dim])
         talker_onnx = f'{onnx_path}/talker.onnx'
-        onnx_export(self, (inputs_embeds, attention_mask, posision_ids, past_key_values),
+        onnx_export(self, (inputs_embeds, attention_mask, posision_ids),
                     talker_onnx,
-                    input_names=['inputs_embeds', 'attention_mask', 'position_ids', 'past_key_values'],
+                    input_names=['inputs_embeds', 'attention_mask', 'position_ids'],
                     output_names=['logits'],
                     dynamic_axes={
                         "inputs_embeds": { 1: "size" },
                         "attention_mask": { 2: "size", 3: "size" },
-                        "position_ids": { 2: "size" },
-                        "past_key_values": { 3: "size" }
+                        "position_ids": { 2: "size" }
                     })
         return talker_onnx

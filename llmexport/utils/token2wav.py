@@ -13,7 +13,6 @@ class Token2Wav(torch.nn.Module):
         self.args = base.args
         self.token2wav = token2wav.float()
         self.config = base.config
-        self.llm_config = base.llm_config
         self.rope_ratio = 1.0
         self.quant_bit = 8
         self.load()
@@ -30,7 +29,7 @@ class Token2Wav(torch.nn.Module):
     def add_generate_ids(self, token_id):
         raise NotImplementedError
 
-    def forward(self, inputs_embeds, attention_mask, position_ids, past_key_values = None):
+    def forward(self, inputs_embeds, attention_mask, position_ids):
         raise NotImplementedError
 
     def export(self, onnx_path):
