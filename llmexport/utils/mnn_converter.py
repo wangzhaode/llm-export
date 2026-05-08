@@ -14,42 +14,50 @@ from .lora import LoRA
 
 EXPORT_LOG = '.export.log'
 
-class MNNConveter:
-    def __init__(self, config, weight_ops = None):
+class MNNConverter:
+    def __init__(self, exporter, weight_ops = None):
         self.weight_ops = weight_ops
-        self.config = config
-        self.quant_block = config.args.quant_block
-        self.quant_bit = config.args.quant_bit
-        self.lm_quant_bit = config.args.lm_quant_bit
-        self.symmetric = config.args.sym
-        self.hqq = config.args.hqq
+        self.exporter = exporter
+        self.args = exporter.args
         self.mnn_weight_offset = 0
-        if os.path.exists(config.args.mnnconvert):
-            self.mnnconvert = config.args.mnnconvert
+        if os.path.exists(self.args.mnnconvert):
+            self.mnnconvert = self.args.mnnconvert
         else:
             self.mnnconvert = None
         self.lm_weight = None
+        self.tie_embeddings_info = None
 
     def convert(self, convert_args):
-        sfd = os.dup(1)
+        import contextlib
         log_fp = open(EXPORT_LOG, "a")
-        log_fd = log_fp.fileno()
-        # mnnconvert ... > .export.log
-        os.dup2(log_fd, 1)
+        sfd = None
         try:
-            sys.argv = convert_args
-            sys.argc = len(convert_args)
-            if self.mnnconvert is None:
-                from MNN.tools import mnnconvert
-                mnnconvert.main()
-            else:
-                convert_args[0] = self.mnnconvert
-                cmd = ' '.join(convert_args)
-                message = os.popen(cmd).read()
-                print(message)
-            sys.argv = []
+            sfd = os.dup(1)
+            log_fd = log_fp.fileno()
+            # mnnconvert ... > .export.log
+            os.dup2(log_fd, 1)
+        except Exception:
+            if sfd is not None:
+                os.close(sfd)
+                sfd = None
+
+        try:
+            with contextlib.redirect_stdout(log_fp):
+                sys.argv = convert_args
+                sys.argc = len(convert_args)
+                if self.mnnconvert is None:
+                    from MNN.tools import mnnconvert
+                    mnnconvert.main()
+                else:
+                    convert_args[0] = self.mnnconvert
+                    cmd = ' '.join(convert_args)
+                    message = os.popen(cmd).read()
+                    print(message)
+                sys.argv = []
         finally:
-            os.dup2(sfd, 1)
+            if sfd is not None:
+                os.dup2(sfd, 1)
+                os.close(sfd)
             log_fp.close()
 
     @spinner_run(f'convert onnx model to ')
@@ -72,7 +80,7 @@ class MNNConveter:
             convert_args += ['--weightQuantAsymmetric=0']
         if save_external_data:
             convert_args += ['--saveExternalData']
-        if self.hqq:
+        if self.args.hqq:
             convert_args += ['--hqq']
         convert_args += args
         self.convert(convert_args)
@@ -121,15 +129,15 @@ class MNNConveter:
     def export(self, onnx_path, quant_bit = None, quant_block = None, transformer_fuse = True, group_conv_native = False, weight_sym = None):
         self.onnx_model_path = onnx_path
         self.mnn_name = os.path.basename(onnx_path).replace('.onnx', '.mnn')
-        self.mnn_model_path = os.path.join(self.config.args.dst_path, self.mnn_name)
+        self.mnn_model_path = os.path.join(self.args.dst_path, self.mnn_name)
         self.mnn_weight_path = f'{self.mnn_model_path}.weight'
         if self.weight_ops is None:
             if quant_bit is None:
-                quant_bit = self.quant_bit
+                quant_bit = self.args.quant_bit
             if quant_block is None:
-                quant_block = self.quant_block
+                quant_block = self.args.quant_block
             if weight_sym is None:
-                weight_sym = self.symmetric
+                weight_sym = self.args.sym
             if quant_bit == 16:
                 quant_args = ['--fp16']
             else:
@@ -150,19 +158,22 @@ class MNNConveter:
             self.json2mnn(mnn_json, self.mnn_model_path)
             self.removeDupOps(self.mnn_model_path)
             self.mnn2json(self.mnn_model_path, mnn_json)
-            if self.config.args.gptq_path is not None:
+            if self.args.gptq_path is not None:
                 self.apply_gptq(mnn_json)
-            if self.config.args.lora_path is not None and self.config.args.lora_split:
+            if self.args.lora_path is not None and self.args.lora_split:
                  self.export_lora(mnn_json)
-            if self.config.args.smooth:
+            if self.args.omni:
+                self.export_omni_quant(mnn_json)
+            if self.args.smooth:
                 self.export_smooth_quant(mnn_json)
+        return self.tie_embeddings_info
 
     def get_experts_graphs(self, experts):
-        hidden_states = torch.randn((1, self.config.hidden_size))
+        hidden_states = torch.randn((1, self.exporter.config.hidden_size))
         layers_num = len(experts)
         expert_num = len(experts[0])
         dummy_expert = experts[0][0]
-        onnx_model = f'{self.config.onnx_path}/expert.onnx'
+        onnx_model = f'{self.exporter.onnx_path}/expert.onnx'
         onnx_export(
             dummy_expert, (hidden_states),
             onnx_model,
@@ -183,8 +194,11 @@ class MNNConveter:
                 inputs.append(node['outputIndexes'][0])
         for output_name in expert_graph['outputName']:
             outputs.append(tensors.index(output_name))
+        # Use actual layer indices (for models where not all layers have MoE)
+        expert_layer_ids = getattr(self.exporter, 'expert_layer_ids', list(range(layers_num)))
         subgraphs = []
         for i in range(layers_num):
+            layer_idx = expert_layer_ids[i]
             for j in range(expert_num):
                 ijnodes = copy.deepcopy(nodes)
                 for op in ijnodes:
@@ -192,10 +206,10 @@ class MNNConveter:
                         for attr in op['main']['attr']:
                             if attr['key'] == 'name':
                                 names = attr['s'].split('/')
-                                names[2] = f'{i}_{j}'
+                                names[2] = f'{layer_idx}_{j}'
                                 attr['s'] = '/'.join(names)
                 subgraph = {
-                    'name': f'/expert/{i}_{j}',
+                    'name': f'/expert/{layer_idx}_{j}',
                     'inputs': inputs,
                     'outputs': outputs,
                     'tensors': copy.deepcopy(tensors),
@@ -207,14 +221,14 @@ class MNNConveter:
 
     @spinner_run(f'apply gptq to ')
     def apply_gptq(self, mnn_json):
-        GPTQ(self.config.args.gptq_path).apply(mnn_json, self.mnn_weight_path)
+        GPTQ(self.args.gptq_path).apply(mnn_json, self.mnn_weight_path)
         return self.mnn_weight_path
 
     @spinner_run(f'export split lora to ')
     def export_lora(self, mnn_json):
-        lora_model = os.path.join(self.config.args.dst_path, 'lora.mnn')
+        lora_model = os.path.join(self.args.dst_path, 'lora.mnn')
         lora_json = f'{lora_model}.json'
-        LoRA(self.config.args.lora_path).apply(mnn_json, lora_json)
+        LoRA(self.args.lora_path).apply(mnn_json, lora_json)
         self.json2mnn(lora_json, lora_model)
         if os.path.exists(lora_json):
             os.remove(lora_json)
@@ -222,16 +236,22 @@ class MNNConveter:
 
     @spinner_run(f'export smooth quant scale to ')
     def export_smooth_quant(self, mnn_json):
-        self.config.smooth_quantizer.apply(mnn_json)
+        self.exporter.smooth_quantizer.apply(mnn_json)
+        self.json2mnn(mnn_json, self.mnn_model_path)
+        return self.mnn_model_path
+
+    @spinner_run(f'export omni quant scale to ')
+    def export_omni_quant(self, mnn_json):
+        self.exporter.omni_quantizer.apply(mnn_json)
         self.json2mnn(mnn_json, self.mnn_model_path)
         return self.mnn_model_path
 
     @spinner_run(f'quant model weight to ', True)
     def rebuild(self, json_path):
         mnn_graph = json.load(open(json_path, 'rt'))
-        has_experts = len(self.config.experts) > 0
+        has_experts = hasattr(self.exporter, 'experts') and len(self.exporter.experts) > 0
         if has_experts:
-            subgraphs = self.get_experts_graphs(self.config.experts)
+            subgraphs = self.get_experts_graphs(self.exporter.experts)
             mnn_graph['subgraphs'] = subgraphs
         new_ops = []
         # Load layernorm weight from external
@@ -242,6 +262,11 @@ class MNNConveter:
                     f.seek(external[0])
                     op['main']['gamma'] = np.frombuffer(f.read(external[1]), np.float32).tolist()
                     op['main']['beta'] = np.frombuffer(f.read(external[2]), np.float32).tolist()
+                    del op['main']['external']
+                if op['type'] == 'Const' and 'external' in op['main']:
+                    external = op['main']['external']
+                    f.seek(external[0])
+                    op['main']['float32s'] = np.frombuffer(f.read(external[1]), np.float32).tolist()
                     del op['main']['external']
         # Rebuild ops
         with open(self.mnn_weight_path, 'wb') as self.mnn_weight:
@@ -265,7 +290,24 @@ class MNNConveter:
         return self.mnn_weight_path
 
     def quant(self, weight, quant_bit, quant_block, symmetric):
-        q_weight, alpha = torch_quant(weight, quant_bit, quant_block, symmetric, self.config.args.awq, self.config.args.hqq)
+        if self.exporter.args.skip_weight:
+            # Skip expensive quantization when skip_weight is enabled
+            oc, ic = weight.shape
+            if quant_block == 0:
+                block_size = ic
+            else:
+                block_size = quant_block
+            block_num = ic // block_size
+            # alpha: oc * block_num (symmetric) or oc * block_num * 2 (asymmetric)
+            alpha_num = oc * block_num * (1 if symmetric else 2)
+            alpha = torch.zeros(alpha_num, dtype=torch.float32)
+            # q_weight: raw size is oc * ic, packed size depends on quant_bit
+            # bits < 8 packing logic matches repack_low_bits
+            q_weight_num = (oc * ic * quant_bit + 7) // 8
+            q_weight = torch.zeros(q_weight_num, dtype=torch.uint8)
+            return q_weight, alpha
+
+        q_weight, alpha = torch_quant(weight.cpu(), quant_bit, quant_block, symmetric, self.args.awq, self.args.hqq)
         return q_weight, alpha
 
     def write_weight(self, data):
@@ -294,23 +336,38 @@ class MNNConveter:
     def build_weight(self, linear, quant_bit, quant_block, symmetric):
         ic, oc = linear.in_features, linear.out_features
         if quant_bit == 16:
-            half_weight = linear.weight.data.flatten().half()
-            weight_len = self.write_weight(half_weight)
+            if self.exporter.args.skip_weight:
+                # Use a small dummy buffer and skip full weight loading/conversion
+                weight_len = (ic * oc * 2)
+                self.mnn_weight.seek(weight_len, 1)
+            else:
+                half_weight = linear.weight.data.flatten().half()
+                weight_len = self.write_weight(half_weight)
             alpha_len, q_min, shape_int32, header_len = 0, 0, False, 0
         else:
             q_min = 1
             assert(quant_bit in (1, 2, 4, 8))
             q_weight, alpha = self.quant(linear.weight.data, quant_bit, quant_block, symmetric)
             header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
-            weight_len = self.write_weight(q_weight) + header_len
-            alpha_len = self.write_weight(alpha)
+            if self.exporter.args.skip_weight:
+                weight_len = len(q_weight) + header_len
+                self.mnn_weight.seek(len(q_weight), 1)
+                alpha_len = len(alpha) * 4
+                self.mnn_weight.seek(alpha_len, 1)
+            else:
+                weight_len = self.write_weight(q_weight) + header_len
+                alpha_len = self.write_weight(alpha)
+
         if linear.bias is not None:
-            bias = linear.bias.data.flatten().float()
-            bias_length = self.write_weight(bias)
+            bias_length = (oc * 4)
+            if self.exporter.args.skip_weight:
+                self.mnn_weight.seek(bias_length, 1)
+            else:
+                bias = linear.bias.data.flatten().float()
+                bias_length = self.write_weight(bias)
         else:
             bias_length = 0
-            # bias = np.zeros([oc], dtype=np.float32)
-            # bias_length = self.write_weight(bias)
+
         external = [self.mnn_weight_offset, weight_len, alpha_len, bias_length, 0]
         self.mnn_weight_offset += (weight_len + alpha_len + bias_length)
         return external, q_min, shape_int32, header_len
@@ -332,6 +389,8 @@ class MNNConveter:
             return self.rebuild_linear(op, graph)
         if op_type == 'FusedAttention':
             return self.rebuild_attnention(op, graph)
+        if op_type == 'FusedLinearAttention':
+            return self.rebuild_linear_attnention(op, graph)
         if op_type == "LayerNorm":
             return self.rebuild_layernorm(op, graph)
         if op_type == 'MoE':
@@ -370,21 +429,84 @@ class MNNConveter:
 
     def rebuild_attnention(self, op, graph):
         attrs = op['main']['attr']
+        layer_index = -1
+        kv_shared_layer_index = -1
         for attr in attrs:
             if attr['key'] == 'name':
                 name = attr['s']
+            elif attr['key'] == 'kv_cache':
+                kv_cache = attr['i']
+            elif attr['key'] == 'layer_index':
+                layer_index = attr.get('i', -1)
+            elif attr['key'] == 'kv_shared_layer_index':
+                kv_shared_layer_index = attr.get('i', -1)
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
+        main_dict = {
+            "kv_cache": bool(kv_cache),
+            "layer_index": layer_index,
+            "kv_shared_layer_index": kv_shared_layer_index,
+        }
         fused_attention = {
             "inputIndexes": origin_input,
             "main_type": "AttentionParam",
-            "main": { "kv_cache": True },
+            "main": main_dict,
             "name": name,
             "outputIndexes": origin_output,
             "type": "Attention",
             "defaultDimentionFormat": "NHWC"
         }
         return [fused_attention]
+
+    def rebuild_linear_attnention(self, op, graph):
+        attrs = op['main']['attr']
+        num_k_heads = 0
+        num_v_heads = 0
+        head_k_dim = 0
+        head_v_dim = 0
+        attn_type = "gated_delta_rule"
+        use_qk_l2norm = False
+        name = ""
+
+        # Parse attributes from Custom Op
+        for attr in attrs:
+            if attr['key'] == 'name':
+                name = attr['s']
+            elif attr['key'] == 'num_k_heads':
+                num_k_heads = attr['i']
+            elif attr['key'] == 'num_v_heads':
+                num_v_heads = attr['i']
+            elif attr['key'] == 'head_k_dim':
+                head_k_dim = attr['i']
+            elif attr['key'] == 'head_v_dim':
+                head_v_dim = attr['i']
+            elif attr['key'] == 'attn_type':
+                attn_type = attr['s']
+            elif attr['key'] == 'use_qk_l2norm':
+                use_qk_l2norm = bool(attr['i'])
+
+        input_indexes = op['inputIndexes']
+        output_indexes = op['outputIndexes']
+
+        linear_attention_param = {
+            "attn_type": attn_type,
+            "num_k_heads": num_k_heads,
+            "num_v_heads": num_v_heads,
+            "head_k_dim": head_k_dim,
+            "head_v_dim": head_v_dim,
+            "use_qk_l2norm": use_qk_l2norm
+        }
+
+        fused_linear_attention = {
+            "inputIndexes": input_indexes,
+            "main_type": "LinearAttentionParam",
+            "main": linear_attention_param,
+            "name": name,
+            "outputIndexes": output_indexes,
+            "type": "LinearAttention",
+            "defaultDimentionFormat": "NHWC"
+        }
+        return [fused_linear_attention]
 
     def rebuild_linear(self, op, graph):
         attrs = op['main']['attr']
@@ -403,19 +525,31 @@ class MNNConveter:
                (linear.bias is not None) == has_bias)
 
         is_lm = 'lm_head' in name
-        quant_bit = self.lm_quant_bit if is_lm else self.quant_bit
-        block_size = ic if self.quant_block == 0 else self.quant_block
+        quant_bit = self.args.lm_quant_bit if is_lm else self.args.quant_bit
+        quant_block = self.args.lm_quant_block if is_lm else self.args.quant_block
+        quant_sym = self.args.sym
+
+        if self.args.quant_config is not None:
+            with open(self.args.quant_config, 'r') as f:
+                quant_config = json.load(f)
+            if name in quant_config:
+                op_config = quant_config[name]
+                quant_bit = op_config.get('bits', quant_bit)
+                quant_block = op_config.get('block_size', quant_block)
+                quant_sym = op_config.get('symmetric', quant_sym)
+
+        block_size = ic if quant_block == 0 else quant_block
         if is_lm and self.lm_weight is not None:
             external, q_min, shape_int32, header_len = self.lm_weight
         else:
-            external, q_min, shape_int32, header_len = self.build_weight(linear, quant_bit, self.quant_block, self.symmetric)
+            external, q_min, shape_int32, header_len = self.build_weight(linear, quant_bit, quant_block, quant_sym)
         if is_lm and self.lm_weight is None:
             self.lm_weight = [external, q_min, shape_int32, header_len]
-        if is_lm and self.config.tie_word_embeddings:
+        if is_lm and self.args.tie_word_embeddings:
             weight_offset = external[0] + header_len
             alpha_offset = external[0] + external[1]
             alpha_size = external[2]
-            self.config.llm_config['tie_embeddings'] = [weight_offset, alpha_offset, alpha_size, quant_bit, self.quant_block]
+            self.tie_embeddings_info = [weight_offset, alpha_offset, alpha_size, quant_bit, quant_block]
 
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
@@ -460,7 +594,7 @@ class MNNConveter:
         if quant_bit == 16:
             quanParameter = { "type": 3 }
         else:
-            if self.symmetric:
+            if self.args.sym:
                 aMin = 0
                 readType = 0
             else:

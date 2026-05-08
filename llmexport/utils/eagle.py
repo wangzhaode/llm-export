@@ -8,10 +8,10 @@ from .transformers import Attention
 from .transformers import RMSNorm
 from .transformers import Rotary
 from .transformers import Embedding
-from .utils.custom_op import FakeLinear
+from utils.custom_op import FakeLinear
 from transformers.configuration_utils import PretrainedConfig
 from transformers.activations import ACT2FN
-from .utils.spinner import spinner_run
+from utils.spinner import spinner_run
 from .torch_utils import onnx_export
 
 
@@ -22,24 +22,22 @@ class Eagle(torch.nn.Module):
         config_file_path = eagle_path + "/config.json"
         self.eagle_config = PretrainedConfig.from_json_file(config_file_path)
 
-        self.model_type = base.model_type
+        self.model_type = base.config.model_type
         self.eagle_path = eagle_path
 
         self.config = base.config
-        if not hasattr(base.config, 'head_dim'):
-            self.config.head_dim = base.head_dim
+        if hasattr(self.eagle_config, "head_dim"):
+            self.config.head_dim = self.eagle_config.head_dim
 
         self.rope_theta = 10000
         self.rope_ratio = 1.0
         self.head_dim = self.config.head_dim
-        self.config.model_type = base.model_type
-        self.config.model_map = base.model_map
-        self.hidden_size = base.hidden_size
+        self.hidden_size = self.config.hidden_size
         if self.eagle_config.hidden_size != self.hidden_size:
             raise RuntimeError(f'eagle_config hidden_size not equal: {self.eagle_config.hidden_size}, {self.hidden_size}!')
-        self.past_kv_shape = base.past_kv_shape
-        self.num_attention_heads = base.num_attention_heads
-        self.llm_config = base.llm_config
+        # self.past_kv_shape = base.past_kv_shape
+        self.num_attention_heads = self.config.num_attention_heads
+        self.past_kv_shape = [self.config.num_hidden_layers, 2, 1, 0, self.config.num_key_value_heads, self.config.head_dim]
 
         self.head_dim = self.config.head_dim
         self.num_key_value_heads = self.config.num_key_value_heads
@@ -47,7 +45,7 @@ class Eagle(torch.nn.Module):
         # self.config.head_dim = self.head_dim
         self.config.rotary = Rotary(self)
         # eagle config params
-        self.padding_idx = self.eagle_config.pad_token_id
+        self.padding_idx = getattr(self.eagle_config, 'pad_token_id', None)
         self.vocab_size = self.eagle_config.vocab_size
         self.draft_vocab_size = self.eagle_config.draft_vocab_size
         # embed_tokens api
@@ -67,7 +65,7 @@ class Eagle(torch.nn.Module):
         # midlayer.input_layernorm
         self.midlayer.input_layernorm = RMSNorm(self.hidden_size, eps=self.eagle_config.rms_norm_eps)
         # midlayer.self_attn
-        self.midlayer.self_attn = Attention(None, 0, self.config)
+        self.midlayer.self_attn = Attention(None, 0, self.config, base.rotary, self.config.model_map)
         self.midlayer.self_attn.q_proj = nn.Linear(self.hidden_size * 2, self.num_attention_heads * self.head_dim, bias=False)
         self.midlayer.self_attn.k_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
         self.midlayer.self_attn.v_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
@@ -122,7 +120,7 @@ class Eagle(torch.nn.Module):
         }
         if model_type in eagles:
             return eagles[model_type]
-        return None
+        return LlamaEagle
 
     @spinner_run(f'export onnx model to ')
     def export(self, onnx_path):
@@ -221,13 +219,13 @@ class LlamaEagle(Eagle):
         rotary_pos_emb = self.config.rotary(position_ids)
 
         # Self Attention
-        hidden_states, present_key_value = self.midlayer.self_attn(
+        self.midlayer.self_attn.past_key_value = past_key_values
+        hidden_states = self.midlayer.self_attn(
             hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,
             attention_mask=attention_mask,
-            past_key_value=past_key_values,
-            cross_attention_states=None,
         )
+        present_key_value = self.midlayer.self_attn.past_key_value
 
         hidden_states = residual + hidden_states
         residual = hidden_states
